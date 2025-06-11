@@ -9,6 +9,7 @@ using System.Threading;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using GrayWolf.GPUInstancing.Domain;
+using System.Diagnostics;
 
 [System.Serializable]
 public class CameraDepthSettings
@@ -52,6 +53,95 @@ public class CameraDepthSettings
     [HideInInspector] public uint sequenceNumber = 0;
 }
 
+// Performance tracking class
+public class PerformanceTracker
+{
+    private struct TimingSample
+    {
+        public double time;
+        public int count;
+    }
+    
+    private Dictionary<string, List<double>> timings = new Dictionary<string, List<double>>();
+    private Dictionary<string, int> counts = new Dictionary<string, int>();
+    private readonly object lockObject = new object();
+    
+    public void RecordTime(string operation, double milliseconds)
+    {
+        lock (lockObject)
+        {
+            if (!timings.ContainsKey(operation))
+            {
+                timings[operation] = new List<double>();
+                counts[operation] = 0;
+            }
+            
+            timings[operation].Add(milliseconds);
+            counts[operation]++;
+            
+            // Keep only last 100 samples to prevent memory growth
+            if (timings[operation].Count > 100)
+            {
+                timings[operation].RemoveAt(0);
+            }
+        }
+    }
+    
+    public string GetSummary()
+    {
+        lock (lockObject)
+        {
+            var summary = new System.Text.StringBuilder();
+            summary.AppendLine("=== PERFORMANCE SUMMARY ===");
+            
+            double totalTime = 0;
+            int totalOperations = 0;
+            
+            foreach (var kvp in timings)
+            {
+                string operation = kvp.Key;
+                var times = kvp.Value;
+                int count = counts[operation];
+                
+                if (times.Count == 0) continue;
+                
+                double sum = 0;
+                double min = double.MaxValue;
+                double max = double.MinValue;
+                
+                foreach (double time in times)
+                {
+                    sum += time;
+                    if (time < min) min = time;
+                    if (time > max) max = time;
+                }
+                
+                double avg = sum / times.Count;
+                totalTime += sum;
+                totalOperations += times.Count;
+                
+                summary.AppendLine($"{operation}: Avg={avg:F2}ms, Min={min:F2}ms, Max={max:F2}ms, Count={count}, Total={sum:F1}ms");
+            }
+            
+            if (totalOperations > 0)
+            {
+                summary.AppendLine($"OVERALL: Total={totalTime:F1}ms, Operations={totalOperations}, Avg per op={totalTime/totalOperations:F2}ms");
+            }
+            
+            return summary.ToString();
+        }
+    }
+    
+    public void Reset()
+    {
+        lock (lockObject)
+        {
+            timings.Clear();
+            counts.Clear();
+        }
+    }
+}
+
 public class MultiCameraLCMDepthCapture : MonoBehaviour
 {
     [Header("Global Settings")]
@@ -76,6 +166,10 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     [SerializeField] private bool skipFramesWhenBehind = true;
     [SerializeField] private bool useOptimizedRGBConversion = true;
     
+    [Header("Performance Monitoring")]
+    [SerializeField] private bool enablePerformanceTracking = true;
+    [SerializeField] private float performanceLogInterval = 5f; // Log summary every N seconds
+    
     private LCM.LCM.LCM lcm;
     private Dictionary<int, RenderTexture> cameraRenderTextures = new Dictionary<int, RenderTexture>();
     private Dictionary<int, AsyncGPUReadbackRequest> pendingDepthRequests = new Dictionary<int, AsyncGPUReadbackRequest>();
@@ -90,6 +184,10 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     private ConcurrentQueue<byte[]> byteArrayPool = new ConcurrentQueue<byte[]>();
     private ConcurrentQueue<float[]> floatArrayPool = new ConcurrentQueue<float[]>();
     
+    // Performance tracking
+    private PerformanceTracker performanceTracker = new PerformanceTracker();
+    private float lastPerformanceLogTime = 0f;
+    
     private class PublishData
     {
         public enum DataType { Depth, RGB, CameraInfo }
@@ -100,6 +198,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         public int Height;
         public CameraDepthSettings Settings;
         public sensor_msgs.CameraInfo CameraInfo;
+        public double CaptureStartTime; // For end-to-end timing
     }
     
     void Start()
@@ -147,9 +246,9 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             
             if (debugMode)
             {
-                Debug.Log($"Camera configured: {settings.camera.name}");
-                Debug.Log($"  Async capture: {settings.useAsyncCapture}");
-                Debug.Log($"  Downsample factor: {settings.downsampleFactor}");
+                UnityEngine.Debug.Log($"Camera configured: {settings.camera.name}");
+                UnityEngine.Debug.Log($"  Async capture: {settings.useAsyncCapture}");
+                UnityEngine.Debug.Log($"  Downsample factor: {settings.downsampleFactor}");
             }
         }
         
@@ -171,19 +270,22 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             
             if (debugMode)
             {
-                Debug.Log($"LCM initialized with URL: {lcmURL}");
-                Debug.Log($"Publisher threads: {numPublishThreads}");
-                Debug.Log($"Optimized RGB conversion: {useOptimizedRGBConversion}");
+                UnityEngine.Debug.Log($"LCM initialized with URL: {lcmURL}");
+                UnityEngine.Debug.Log($"Publisher threads: {numPublishThreads}");
+                UnityEngine.Debug.Log($"Optimized RGB conversion: {useOptimizedRGBConversion}");
+                UnityEngine.Debug.Log($"Performance tracking: {enablePerformanceTracking}");
             }
         }
         catch (Exception ex)
         {
-            Debug.LogError("Error during LCM initialization: " + ex.Message);
+            UnityEngine.Debug.LogError("Error during LCM initialization: " + ex.Message);
         }
     }
     
     void SetupCameraRenderTexture(CameraDepthSettings settings)
     {
+        var sw = Stopwatch.StartNew();
+        
         int width = settings.useNativeResolution ? settings.camera.pixelWidth : settings.rgbWidth;
         int height = settings.useNativeResolution ? settings.camera.pixelHeight : settings.rgbHeight;
         
@@ -204,12 +306,18 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         
         cameraRenderTextures[settings.cameraInstanceID] = rt;
         
+        sw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("Setup_RenderTexture", sw.Elapsed.TotalMilliseconds);
+        
         if (debugMode)
-            Debug.Log($"Created RGB render texture for {settings.camera.name}: {width}x{height} (ARGB32 format)");
+            UnityEngine.Debug.Log($"Created RGB render texture for {settings.camera.name}: {width}x{height} (ARGB32 format)");
     }
     
     void OnCameraRendering(ScriptableRenderContext context, Camera camera)
     {
+        var totalSw = Stopwatch.StartNew();
+        
         // Find settings for this camera
         CameraDepthSettings settings = null;
         foreach (var s in cameraSettings)
@@ -248,40 +356,60 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         if (skipFramesWhenBehind && publishQueue.Count > maxQueueSize)
         {
             if (debugMode)
-                Debug.LogWarning($"Skipping frame for {camera.name} - queue full ({publishQueue.Count} items)");
+                UnityEngine.Debug.LogWarning($"Skipping frame for {camera.name} - queue full ({publishQueue.Count} items)");
             return;
         }
         
         // Capture RGB using the camera's current render
         if (cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture rt))
         {
+            var blitSw = Stopwatch.StartNew();
+            
             // Blit current camera render to our capture texture
             var cmd = CommandBufferPool.Get("CaptureRGB");
             cmd.Blit(BuiltinRenderTextureType.CameraTarget, rt);
             context.ExecuteCommandBuffer(cmd);
             CommandBufferPool.Release(cmd);
             
+            blitSw.Stop();
+            if (enablePerformanceTracking)
+                performanceTracker.RecordTime("Camera_Blit", blitSw.Elapsed.TotalMilliseconds);
+            
             // Request async readback if not already pending
             if (!pendingRGBRequests.ContainsKey(settings.cameraInstanceID) || 
                 pendingRGBRequests[settings.cameraInstanceID].done)
             {
+                double captureStartTime = (DateTime.UtcNow - DateTime.UnixEpoch).TotalMilliseconds;
+                
                 if (settings.useAsyncCapture)
                 {
                     var request = AsyncGPUReadback.Request(rt, 0, 
-                        (AsyncGPUReadbackRequest r) => OnRGBReadbackComplete(r, settings));
+                        (AsyncGPUReadbackRequest r) => OnRGBReadbackComplete(r, settings, captureStartTime));
                     pendingRGBRequests[settings.cameraInstanceID] = request;
                 }
                 else
                 {
-                    CaptureRGBSynchronous(rt, settings);
+                    CaptureRGBSynchronous(rt, settings, captureStartTime);
                 }
             }
         }
+        
+        totalSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("OnCameraRendering_Total", totalSw.Elapsed.TotalMilliseconds);
     }
     
     void Update()
     {
         if (lcm == null) return;
+        
+        // Log performance summary periodically
+        if (enablePerformanceTracking && Time.time - lastPerformanceLogTime >= performanceLogInterval)
+        {
+            UnityEngine.Debug.Log(performanceTracker.GetSummary());
+            performanceTracker.Reset();
+            lastPerformanceLogTime = Time.time;
+        }
         
         // Check for capture keys
         if (Input.GetKeyDown(captureAllKey))
@@ -329,25 +457,25 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 }
             }
         }
-        
-        // Display queue status in debug mode
-        if (debugMode && Time.frameCount % 60 == 0) // Every 60 frames
-        {
-            Debug.Log($"Publish queue size: {publishQueue.Count}");
-        }
     }
     
     private void CaptureDepthForCamera(CameraDepthSettings settings)
     {
+        var totalSw = Stopwatch.StartNew();
+        
         // Skip if queue is full
         if (skipFramesWhenBehind && publishQueue.Count > maxQueueSize) return;
         
+        var textureSw = Stopwatch.StartNew();
         RTHandle depthTexture = MultiCameraPersistentDepthFeature.GetPersistentDepthTexture(settings.cameraInstanceID);
+        textureSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("Get_DepthTexture", textureSw.Elapsed.TotalMilliseconds);
         
         if (depthTexture == null || depthTexture.rt == null)
         {
             if (debugMode)
-                Debug.LogWarning($"Persistent depth texture not available for camera: {settings.camera.name}");
+                UnityEngine.Debug.LogWarning($"Persistent depth texture not available for camera: {settings.camera.name}");
             return;
         }
         
@@ -359,9 +487,12 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         }
         
         Texture sourceTexture = depthTexture.rt;
+        double captureStartTime = (DateTime.UtcNow - DateTime.UnixEpoch).TotalMilliseconds;
         
         if (settings.useAsyncCapture)
         {
+            var requestSw = Stopwatch.StartNew();
+            
             // Create temporary RT for async readback if downsampling
             if (settings.downsampleFactor > 1)
             {
@@ -373,20 +504,24 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 var request = AsyncGPUReadback.Request(tempRT, 0,
                     (AsyncGPUReadbackRequest r) => {
                         RenderTexture.ReleaseTemporary(tempRT);
-                        OnDepthReadbackComplete(r, settings);
+                        OnDepthReadbackComplete(r, settings, captureStartTime);
                     });
                 pendingDepthRequests[settings.cameraInstanceID] = request;
             }
             else
             {
                 var request = AsyncGPUReadback.Request(sourceTexture, 0,
-                    (AsyncGPUReadbackRequest r) => OnDepthReadbackComplete(r, settings));
+                    (AsyncGPUReadbackRequest r) => OnDepthReadbackComplete(r, settings, captureStartTime));
                 pendingDepthRequests[settings.cameraInstanceID] = request;
             }
+            
+            requestSw.Stop();
+            if (enablePerformanceTracking)
+                performanceTracker.RecordTime("Depth_AsyncRequest", requestSw.Elapsed.TotalMilliseconds);
         }
         else
         {
-            CaptureDepthSynchronous(sourceTexture, settings);
+            CaptureDepthSynchronous(sourceTexture, settings, captureStartTime);
         }
         
         // Publish camera info (lightweight, can do immediately)
@@ -397,18 +532,25 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         
         // Increment sequence number
         settings.sequenceNumber++;
+        
+        totalSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("CaptureDepthForCamera_Total", totalSw.Elapsed.TotalMilliseconds);
     }
     
-    private void OnDepthReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings)
+    private void OnDepthReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings, double captureStartTime)
     {
+        var totalSw = Stopwatch.StartNew();
+        
         if (request.hasError)
         {
-            Debug.LogError($"Async depth readback failed for camera {settings.camera.name}");
+            UnityEngine.Debug.LogError($"Async depth readback failed for camera {settings.camera.name}");
             return;
         }
         
         try
         {
+            var copySw = Stopwatch.StartNew();
             var data = request.GetData<float>();
             int width = request.width;
             int height = request.height;
@@ -430,9 +572,16 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                     depthArray[i] = 1.0f; // Will be linearized to far plane
                 }
             }
+            copySw.Stop();
+            if (enablePerformanceTracking)
+                performanceTracker.RecordTime("Depth_DataCopy", copySw.Elapsed.TotalMilliseconds);
             
             // Linearize depth values
+            var linearizeSw = Stopwatch.StartNew();
             LinearizeDepthValuesInPlace(depthArray, settings.camera);
+            linearizeSw.Stop();
+            if (enablePerformanceTracking)
+                performanceTracker.RecordTime("Depth_Linearization", linearizeSw.Elapsed.TotalMilliseconds);
             
             // Queue for publishing
             var publishData = new PublishData
@@ -441,22 +590,29 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 DepthData = depthArray,
                 Width = width,
                 Height = height,
-                Settings = settings
+                Settings = settings,
+                CaptureStartTime = captureStartTime
             };
             
             publishQueue.Enqueue(publishData);
         }
         catch (Exception ex)
         {
-            Debug.LogError($"Error processing depth readback for camera {settings.camera.name}: {ex.Message}");
+            UnityEngine.Debug.LogError($"Error processing depth readback for camera {settings.camera.name}: {ex.Message}");
         }
+        
+        totalSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("OnDepthReadbackComplete_Total", totalSw.Elapsed.TotalMilliseconds);
     }
     
-    private void OnRGBReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings)
+    private void OnRGBReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings, double captureStartTime)
     {
+        var totalSw = Stopwatch.StartNew();
+        
         if (request.hasError)
         {
-            Debug.LogError($"Async RGB readback failed for camera {settings.camera.name}");
+            UnityEngine.Debug.LogError($"Async RGB readback failed for camera {settings.camera.name}");
             return;
         }
         
@@ -466,28 +622,37 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         
         try
         {
+            var dataCopySw = Stopwatch.StartNew();
             var data = request.GetData<byte>();
             int totalBytes = data.Length;
             int bytesPerPixel = totalBytes / pixelCount;
+            dataCopySw.Stop();
+            if (enablePerformanceTracking)
+                performanceTracker.RecordTime("RGB_GetData", dataCopySw.Elapsed.TotalMilliseconds);
             
             if (debugMode && bytesPerPixel != 4)
             {
-                Debug.LogWarning($"Expected 4 bytes per pixel, got {bytesPerPixel} for {settings.camera.name}");
+                UnityEngine.Debug.LogWarning($"Expected 4 bytes per pixel, got {bytesPerPixel} for {settings.camera.name}");
             }
             
             byte[] rgbArray = null;
             
             if (bytesPerPixel == 3)
             {
+                var copySw = Stopwatch.StartNew();
                 // Already RGB24, just copy
                 rgbArray = GetPooledByteArray(totalBytes);
                 NativeArray<byte>.Copy(data, rgbArray, totalBytes);
+                copySw.Stop();
+                if (enablePerformanceTracking)
+                    performanceTracker.RecordTime("RGB_DirectCopy", copySw.Elapsed.TotalMilliseconds);
             }
             else if (bytesPerPixel == 4)
             {
                 // RGBA32 to RGB24 conversion
                 rgbArray = GetPooledByteArray(pixelCount * 3);
                 
+                var conversionSw = Stopwatch.StartNew();
                 if (useOptimizedRGBConversion)
                 {
                     // Use optimized unsafe conversion
@@ -498,10 +663,14 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                     // Fallback to safe conversion
                     ConvertRGBAToRGBSafe(data, rgbArray, pixelCount);
                 }
+                conversionSw.Stop();
+                if (enablePerformanceTracking)
+                    performanceTracker.RecordTime(useOptimizedRGBConversion ? "RGB_OptimizedConversion" : "RGB_SafeConversion", 
+                        conversionSw.Elapsed.TotalMilliseconds);
             }
             else
             {
-                Debug.LogError($"Unsupported bytes per pixel: {bytesPerPixel}");
+                UnityEngine.Debug.LogError($"Unsupported bytes per pixel: {bytesPerPixel}");
                 return;
             }
             
@@ -512,15 +681,20 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 Data = rgbArray,
                 Width = width,
                 Height = height,
-                Settings = settings
+                Settings = settings,
+                CaptureStartTime = captureStartTime
             };
             
             publishQueue.Enqueue(publishData);
         }
         catch (Exception ex)
         {
-            Debug.LogError($"Error processing RGB readback for camera {settings.camera.name}: {ex.Message}");
+            UnityEngine.Debug.LogError($"Error processing RGB readback for camera {settings.camera.name}: {ex.Message}");
         }
+        
+        totalSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("OnRGBReadbackComplete_Total", totalSw.Elapsed.TotalMilliseconds);
     }
     
     private unsafe void ConvertRGBAToRGBOptimized(NativeArray<byte> rgba, byte[] rgb, int pixelCount)
@@ -572,11 +746,14 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         }
     }
     
-    private void CaptureDepthSynchronous(Texture sourceTexture, CameraDepthSettings settings)
+    private void CaptureDepthSynchronous(Texture sourceTexture, CameraDepthSettings settings, double captureStartTime)
     {
+        var totalSw = Stopwatch.StartNew();
+        
         int width = sourceTexture.width / settings.downsampleFactor;
         int height = sourceTexture.height / settings.downsampleFactor;
         
+        var renderSw = Stopwatch.StartNew();
         RenderTexture tempRT = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.RFloat);
         Graphics.Blit(sourceTexture, tempRT);
         
@@ -585,9 +762,16 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         depthImage.ReadPixels(new Rect(0, 0, width, height), 0, 0);
         depthImage.Apply();
         RenderTexture.active = null;
+        renderSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("Depth_SyncRender", renderSw.Elapsed.TotalMilliseconds);
         
+        var processSw = Stopwatch.StartNew();
         Color[] rawDepthPixels = depthImage.GetPixels();
         float[] linearDepthValues = LinearizeDepthValues(rawDepthPixels, settings.camera);
+        processSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("Depth_SyncProcess", processSw.Elapsed.TotalMilliseconds);
         
         var publishData = new PublishData
         {
@@ -595,24 +779,39 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             DepthData = linearDepthValues,
             Width = width,
             Height = height,
-            Settings = settings
+            Settings = settings,
+            CaptureStartTime = captureStartTime
         };
         
         publishQueue.Enqueue(publishData);
         
         RenderTexture.ReleaseTemporary(tempRT);
         DestroyImmediate(depthImage);
+        
+        totalSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("CaptureDepthSynchronous_Total", totalSw.Elapsed.TotalMilliseconds);
     }
     
-    private void CaptureRGBSynchronous(RenderTexture sourceTexture, CameraDepthSettings settings)
+    private void CaptureRGBSynchronous(RenderTexture sourceTexture, CameraDepthSettings settings, double captureStartTime)
     {
+        var totalSw = Stopwatch.StartNew();
+        
+        var renderSw = Stopwatch.StartNew();
         RenderTexture.active = sourceTexture;
         Texture2D rgbImage = new Texture2D(sourceTexture.width, sourceTexture.height, TextureFormat.RGB24, false);
         rgbImage.ReadPixels(new Rect(0, 0, sourceTexture.width, sourceTexture.height), 0, 0);
         rgbImage.Apply();
         RenderTexture.active = null;
+        renderSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("RGB_SyncRender", renderSw.Elapsed.TotalMilliseconds);
         
+        var dataSw = Stopwatch.StartNew();
         byte[] rgbData = rgbImage.GetRawTextureData();
+        dataSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("RGB_GetRawData", dataSw.Elapsed.TotalMilliseconds);
         
         var publishData = new PublishData
         {
@@ -620,18 +819,23 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             Data = rgbData,
             Width = sourceTexture.width,
             Height = sourceTexture.height,
-            Settings = settings
+            Settings = settings,
+            CaptureStartTime = captureStartTime
         };
         
         publishQueue.Enqueue(publishData);
         
         DestroyImmediate(rgbImage);
+        
+        totalSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("CaptureRGBSynchronous_Total", totalSw.Elapsed.TotalMilliseconds);
     }
     
     private void PublishThreadWorker(string threadName)
     {
         if (debugMode)
-            Debug.Log($"Started {threadName}");
+            UnityEngine.Debug.Log($"Started {threadName}");
         
         while (isRunning)
         {
@@ -640,6 +844,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             // Process items without artificial limits
             while (publishQueue.TryDequeue(out PublishData data))
             {
+                var sw = Stopwatch.StartNew();
                 try
                 {
                     switch (data.Type)
@@ -654,11 +859,23 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                             lcm.Publish(data.Settings.cameraInfoTopicName, data.CameraInfo);
                             break;
                     }
+                    
+                    sw.Stop();
+                    if (enablePerformanceTracking)
+                    {
+                        performanceTracker.RecordTime($"Publish_{data.Type}", sw.Elapsed.TotalMilliseconds);
+                        
+                        // Record end-to-end time
+                        double endTime = (DateTime.UtcNow - DateTime.UnixEpoch).TotalMilliseconds;
+                        double endToEndTime = endTime - data.CaptureStartTime;
+                        performanceTracker.RecordTime($"EndToEnd_{data.Type}", endToEndTime);
+                    }
+                    
                     processedAny = true;
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogError($"Error publishing data in {threadName}: {ex.Message}");
+                    UnityEngine.Debug.LogError($"Error publishing data in {threadName}: {ex.Message}");
                 }
                 finally
                 {
@@ -678,7 +895,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         }
         
         if (debugMode)
-            Debug.Log($"Stopped {threadName}");
+            UnityEngine.Debug.Log($"Stopped {threadName}");
     }
     
     private void LinearizeDepthValuesInPlace(float[] depthValues, Camera camera)
@@ -719,6 +936,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     
     private void PublishDepthToLCM(PublishData data)
     {
+        var msgSw = Stopwatch.StartNew();
         var imageMsg = new sensor_msgs.Image();
         imageMsg.header = CreateHeader(data.Settings.sequenceNumber, data.Settings.depthFrameID);
         imageMsg.height = data.Height;
@@ -732,8 +950,15 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         imageMsg.data_length = dataSize;
         
         Buffer.BlockCopy(data.DepthData, 0, imageMsg.data, 0, dataSize);
+        msgSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("Depth_MessageConstruction", msgSw.Elapsed.TotalMilliseconds);
         
+        var publishSw = Stopwatch.StartNew();
         lcm.Publish(data.Settings.depthTopicName, imageMsg);
+        publishSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("Depth_LCMPublish", publishSw.Elapsed.TotalMilliseconds);
         
         // Return byte array to pool after publishing
         ReturnByteArrayToPool(imageMsg.data);
@@ -741,6 +966,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     
     private void PublishRGBToLCM(PublishData data)
     {
+        var msgSw = Stopwatch.StartNew();
         var imageMsg = new sensor_msgs.Image();
         imageMsg.header = CreateHeader(data.Settings.sequenceNumber, data.Settings.rgbFrameID);
         imageMsg.height = data.Height;
@@ -750,21 +976,34 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         imageMsg.step = data.Width * 3;
         imageMsg.data = data.Data;
         imageMsg.data_length = data.Data.Length;
+        msgSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("RGB_MessageConstruction", msgSw.Elapsed.TotalMilliseconds);
         
+        var publishSw = Stopwatch.StartNew();
         lcm.Publish(data.Settings.rgbTopicName, imageMsg);
+        publishSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("RGB_LCMPublish", publishSw.Elapsed.TotalMilliseconds);
     }
     
     private void PublishCameraInfo(CameraDepthSettings settings)
     {
+        var sw = Stopwatch.StartNew();
         var cameraInfoMsg = CreateCameraInfoMessage(settings);
         
         var publishData = new PublishData
         {
             Type = PublishData.DataType.CameraInfo,
             CameraInfo = cameraInfoMsg,
-            Settings = settings
+            Settings = settings,
+            CaptureStartTime = (DateTime.UtcNow - DateTime.UnixEpoch).TotalMilliseconds
         };
         publishQueue.Enqueue(publishData);
+        
+        sw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("CameraInfo_Creation", sw.Elapsed.TotalMilliseconds);
     }
     
     private sensor_msgs.CameraInfo CreateCameraInfoMessage(CameraDepthSettings settings)
@@ -875,6 +1114,13 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     {
         isRunning = false;
         
+        // Log final performance summary
+        if (enablePerformanceTracking)
+        {
+            UnityEngine.Debug.Log("=== FINAL PERFORMANCE SUMMARY ===");
+            UnityEngine.Debug.Log(performanceTracker.GetSummary());
+        }
+        
         // Wait for all publishing threads to finish
         if (publishThreads != null)
         {
@@ -941,7 +1187,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         cameraSettings.Add(newSettings);
         
         if (debugMode)
-            Debug.Log($"Added camera {camera.name} for capture");
+            UnityEngine.Debug.Log($"Added camera {camera.name} for capture");
     }
     
     public void RemoveCamera(Camera camera)
@@ -969,7 +1215,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 cameraSettings.RemoveAt(i);
                 
                 if (debugMode)
-                    Debug.Log($"Removed camera {camera.name} from capture");
+                    UnityEngine.Debug.Log($"Removed camera {camera.name} from capture");
                 break;
             }
         }

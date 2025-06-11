@@ -405,7 +405,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6e035b6a726f24749a98f87640d22f2d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  debugMode: 1
+  debugMode: 0
   lcmURL: udpm://239.255.76.67:7667?ttl=1
   depthEncoding: 32FC1
   rgbEncoding: rgb8
@@ -458,7 +458,7 @@ MonoBehaviour:
     sequenceNumber: 0
   captureAllKey: 32
   globalContinuousMode: 1
-  globalPublishRate: 5
+  globalPublishRate: 15
   useBackgroundThread: 1
   maxQueueSize: 10
   skipFramesWhenBehind: 1
