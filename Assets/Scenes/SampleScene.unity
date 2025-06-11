@@ -459,9 +459,12 @@ MonoBehaviour:
   captureAllKey: 32
   globalContinuousMode: 1
   globalPublishRate: 15
-  useBackgroundThread: 1
-  maxQueueSize: 10
+  numPublishThreads: 3
+  maxQueueSize: 8
   skipFramesWhenBehind: 1
+  useOptimizedRGBConversion: 1
+  enablePerformanceTracking: 1
+  performanceLogInterval: 5
 --- !u!1 &5460940
 GameObject:
   m_ObjectHideFlags: 0
