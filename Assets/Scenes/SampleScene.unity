@@ -405,11 +405,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6e035b6a726f24749a98f87640d22f2d, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  debugMode: 0
-  useAsyncReadback: 0
-  maxConcurrentReadbacks: 10
-  useBackgroundThreads: 0
-  backgroundThreadCount: 4
+  debugMode: 1
   lcmURL: udpm://239.255.76.67:7667?ttl=1
   depthEncoding: 32FC1
   rgbEncoding: rgb8
@@ -431,6 +427,8 @@ MonoBehaviour:
     rgbWidth: 1280
     rgbHeight: 800
     useNativeResolution: 1
+    downsampleFactor: 1
+    useAsyncCapture: 1
     captureRequested: 0
     nextCaptureTime: 0
     cameraInstanceID: 0
@@ -452,6 +450,8 @@ MonoBehaviour:
     rgbWidth: 1280
     rgbHeight: 800
     useNativeResolution: 1
+    downsampleFactor: 1
+    useAsyncCapture: 1
     captureRequested: 0
     nextCaptureTime: 0
     cameraInstanceID: 0
@@ -459,6 +459,9 @@ MonoBehaviour:
   captureAllKey: 32
   globalContinuousMode: 1
   globalPublishRate: 5
+  useBackgroundThread: 1
+  maxQueueSize: 10
+  skipFramesWhenBehind: 1
 --- !u!1 &5460940
 GameObject:
   m_ObjectHideFlags: 0

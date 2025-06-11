@@ -1,11 +1,12 @@
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 using LCM.LCM;
 using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Threading;
-using System.Threading.Tasks;
+using Unity.Collections;
 using GrayWolf.GPUInstancing.Domain;
 
 [System.Serializable]
@@ -38,7 +39,11 @@ public class CameraDepthSettings
     [Header("RGB Settings")]
     public int rgbWidth = 640;
     public int rgbHeight = 480;
-    public bool useNativeResolution = true; // Use camera's actual render resolution
+    public bool useNativeResolution = true;
+    
+    [Header("Performance Settings")]
+    public int downsampleFactor = 1; // 1 = full res, 2 = half res, etc.
+    public bool useAsyncCapture = true;
     
     [HideInInspector] public bool captureRequested = false;
     [HideInInspector] public float nextCaptureTime = 0f;
@@ -51,16 +56,10 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     [Header("Global Settings")]
     [SerializeField] private bool debugMode = true;
     
-    [Header("Performance Settings")]
-    [SerializeField] private bool useAsyncReadback = true;
-    [SerializeField] private int maxConcurrentReadbacks = 4;
-    [SerializeField] private bool useBackgroundThreads = true;
-    [SerializeField] private int backgroundThreadCount = 2;
-    
     [Header("LCM Settings")]
-    [SerializeField] private string lcmURL = "udpm://239.255.76.67:7667";
-    [SerializeField] private string depthEncoding = "32FC1"; // 32-bit float, 1 channel
-    [SerializeField] private string rgbEncoding = "rgb8"; // 8-bit RGB, 3 channels
+    [SerializeField] private string lcmURL = "udpm://239.255.76.67:7667?ttl=1";
+    [SerializeField] private string depthEncoding = "32FC1";
+    [SerializeField] private string rgbEncoding = "rgb8";
     
     [Header("Camera Configurations")]
     [SerializeField] private List<CameraDepthSettings> cameraSettings = new List<CameraDepthSettings>();
@@ -70,62 +69,40 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     [SerializeField] private bool globalContinuousMode = false;
     [SerializeField] private float globalPublishRate = 10f;
     
+    [Header("Performance")]
+    [SerializeField] private bool useBackgroundThread = true;
+    [SerializeField] private int maxQueueSize = 10;
+    [SerializeField] private bool skipFramesWhenBehind = true;
+    
     private LCM.LCM.LCM lcm;
     private Dictionary<int, RenderTexture> cameraRenderTextures = new Dictionary<int, RenderTexture>();
+    private Dictionary<int, AsyncGPUReadbackRequest> pendingDepthRequests = new Dictionary<int, AsyncGPUReadbackRequest>();
+    private Dictionary<int, AsyncGPUReadbackRequest> pendingRGBRequests = new Dictionary<int, AsyncGPUReadbackRequest>();
     
-    // Performance optimization fields
-    private Dictionary<int, Texture2D> pooledDepthTextures = new Dictionary<int, Texture2D>();
-    private Dictionary<int, Texture2D> pooledRGBTextures = new Dictionary<int, Texture2D>();
-    private ConcurrentQueue<PublishTask> publishQueue = new ConcurrentQueue<PublishTask>();
-    private int activeReadbacks = 0;
-    private CancellationTokenSource cancellationTokenSource;
-    private Task[] backgroundTasks;
+    // Background thread for LCM publishing
+    private Thread publishThread;
+    private ConcurrentQueue<PublishData> publishQueue = new ConcurrentQueue<PublishData>();
+    private bool isRunning = true;
     
-    private struct PublishTask
+    // Object pooling for memory efficiency
+    private Queue<byte[]> byteArrayPool = new Queue<byte[]>();
+    private Queue<float[]> floatArrayPool = new Queue<float[]>();
+    
+    private class PublishData
     {
-        public TaskType type;
-        public byte[] data;
-        public int width;
-        public int height;
-        public float[] depthData; // For depth tasks
-        public CameraInfoData cameraInfoData; // For camera info tasks
-        public PublishMetadata metadata; // Topic names, frame IDs, etc.
-    }
-    
-    private struct PublishMetadata
-    {
-        public string topicName;
-        public string frameId;
-        public uint sequenceNumber;
-        public string encoding;
-    }
-    
-    private struct CameraInfoData
-    {
-        public int width;
-        public int height;
-        public float fx;
-        public float fy;
-        public float cx;
-        public float cy;
-        public uint sequenceNumber;
-        public string frameId;
-        public string topicName;
-    }
-    
-    private enum TaskType
-    {
-        Depth,
-        RGB,
-        CameraInfo
+        public enum DataType { Depth, RGB, CameraInfo }
+        public DataType Type;
+        public byte[] Data;
+        public float[] DepthData;
+        public int Width;
+        public int Height;
+        public CameraDepthSettings Settings;
+        public sensor_msgs.CameraInfo CameraInfo;
     }
     
     void Start()
     {
-        // Initialize cancellation token
-        cancellationTokenSource = new CancellationTokenSource();
-        
-        // Auto-detect cameras if none are configured
+        // Auto-detect cameras if none configured
         if (cameraSettings.Count == 0)
         {
             Camera[] cameras = FindObjectsOfType<Camera>();
@@ -152,70 +129,51 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         {
             if (settings.camera == null) continue;
             
-            // Store camera instance ID for lookup
             settings.cameraInstanceID = settings.camera.GetInstanceID();
             
-            // CRITICAL: Enable depth texture on each camera for URP
+            // Enable depth texture
             if (settings.captureDepth)
             {
                 settings.camera.depthTextureMode = DepthTextureMode.Depth;
             }
             
-            // Setup render texture for RGB capture if needed
+            // Subscribe to render pipeline callbacks for RGB capture (avoids Camera.Render())
             if (settings.captureRGB)
             {
                 SetupCameraRenderTexture(settings);
             }
             
-            // Pre-allocate pooled textures for performance
-            if (useAsyncReadback)
-            {
-                SetupPooledTextures(settings);
-            }
-            
             if (debugMode)
             {
                 Debug.Log($"Camera configured: {settings.camera.name}");
-                Debug.Log($"  Depth topic: {settings.depthTopicName}");
-                Debug.Log($"  RGB topic: {settings.rgbTopicName}");
-                Debug.Log($"  Camera info topic: {settings.cameraInfoTopicName}");
-                Debug.Log($"  Near: {settings.camera.nearClipPlane}m, Far: {settings.camera.farClipPlane}m");
-                
-                if (settings.continuousMode || globalContinuousMode)
-                {
-                    float rate = globalContinuousMode ? globalPublishRate : settings.publishRate;
-                    Debug.Log($"  Continuous mode: {rate} Hz");
-                }
-                else
-                {
-                    Debug.Log($"  Manual capture key: {settings.captureKey}");
-                }
+                Debug.Log($"  Async capture: {settings.useAsyncCapture}");
+                Debug.Log($"  Downsample factor: {settings.downsampleFactor}");
             }
         }
         
         try
         {
-            // Initialize LCM
             lcm = new LCM.LCM.LCM(lcmURL);
             
-            // Start background publishing threads if enabled
-            if (useBackgroundThreads)
+            // Start background publishing thread
+            if (useBackgroundThread)
             {
-                StartBackgroundThreads();
+                publishThread = new Thread(PublishThreadWorker);
+                publishThread.Start();
             }
+            
+            // Subscribe to render pipeline events for RGB capture
+            RenderPipelineManager.endCameraRendering += OnCameraRendering;
             
             if (debugMode)
             {
                 Debug.Log($"LCM initialized with URL: {lcmURL}");
-                Debug.Log($"Press '{captureAllKey}' to capture all cameras");
-                Debug.Log($"Configured {cameraSettings.Count} cameras for capture");
-                Debug.Log($"Performance: AsyncReadback={useAsyncReadback}, BackgroundThreads={useBackgroundThreads}");
+                Debug.Log($"Background thread: {useBackgroundThread}");
             }
         }
         catch (Exception ex)
         {
             Debug.LogError("Error during LCM initialization: " + ex.Message);
-            Debug.LogException(ex);
         }
     }
     
@@ -224,86 +182,96 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         int width = settings.useNativeResolution ? settings.camera.pixelWidth : settings.rgbWidth;
         int height = settings.useNativeResolution ? settings.camera.pixelHeight : settings.rgbHeight;
         
-        // Fallback to specified dimensions if camera dimensions are invalid
+        // Apply downsample factor
+        width /= settings.downsampleFactor;
+        height /= settings.downsampleFactor;
+        
         if (width <= 0 || height <= 0)
         {
-            width = settings.rgbWidth;
-            height = settings.rgbHeight;
+            width = settings.rgbWidth / settings.downsampleFactor;
+            height = settings.rgbHeight / settings.downsampleFactor;
         }
         
-        RenderTexture rt = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32);
+        // Create with ARGB32 format for consistent handling
+        RenderTexture rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32);
         rt.name = $"RGB_Capture_{settings.camera.name}";
         rt.Create();
         
         cameraRenderTextures[settings.cameraInstanceID] = rt;
         
         if (debugMode)
-            Debug.Log($"Created RGB render texture for {settings.camera.name}: {width}x{height}");
+            Debug.Log($"Created RGB render texture for {settings.camera.name}: {width}x{height} (ARGB32 format)");
     }
     
-    void SetupPooledTextures(CameraDepthSettings settings)
+    void OnCameraRendering(ScriptableRenderContext context, Camera camera)
     {
-        // Setup pooled depth texture
-        if (settings.captureDepth)
+        // Find settings for this camera
+        CameraDepthSettings settings = null;
+        foreach (var s in cameraSettings)
         {
-            RTHandle depthTexture = MultiCameraPersistentDepthFeature.GetPersistentDepthTexture(settings.cameraInstanceID);
-            if (depthTexture != null && depthTexture.rt != null)
+            if (s.camera == camera && s.enabled && s.captureRGB)
             {
-                Texture2D pooledDepth = new Texture2D(depthTexture.rt.width, depthTexture.rt.height, TextureFormat.RFloat, false);
-                pooledDepthTextures[settings.cameraInstanceID] = pooledDepth;
+                settings = s;
+                break;
             }
         }
         
-        // Setup pooled RGB texture
-        if (settings.captureRGB && cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture rt))
+        if (settings == null) return;
+        
+        // Check if we should capture this frame
+        bool shouldCapture = false;
+        
+        if (globalContinuousMode || settings.continuousMode)
         {
-            Texture2D pooledRGB = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false);
-            pooledRGBTextures[settings.cameraInstanceID] = pooledRGB;
-        }
-    }
-    
-    void StartBackgroundThreads()
-    {
-        backgroundTasks = new Task[backgroundThreadCount];
-        for (int i = 0; i < backgroundThreadCount; i++)
-        {
-            backgroundTasks[i] = Task.Run(() => BackgroundPublishWorker(cancellationTokenSource.Token));
+            if (Time.time >= settings.nextCaptureTime)
+            {
+                float rate = globalContinuousMode ? globalPublishRate : settings.publishRate;
+                settings.nextCaptureTime = Time.time + (1f / rate);
+                shouldCapture = true;
+            }
         }
         
-        if (debugMode)
-            Debug.Log($"Started {backgroundThreadCount} background publishing threads");
-    }
-    
-    async void BackgroundPublishWorker(CancellationToken cancellationToken)
-    {
-        while (!cancellationToken.IsCancellationRequested)
+        if (settings.captureRequested)
         {
-            if (publishQueue.TryDequeue(out PublishTask task))
+            shouldCapture = true;
+            settings.captureRequested = false;
+        }
+        
+        if (!shouldCapture) return;
+        
+        // Check if we should skip this frame due to queue backup
+        if (skipFramesWhenBehind && publishQueue.Count > maxQueueSize)
+        {
+            if (debugMode)
+                Debug.LogWarning($"Skipping frame for {camera.name} - queue full ({publishQueue.Count} items)");
+            return;
+        }
+        
+        // Capture RGB using the camera's current render (no extra Camera.Render() call!)
+        if (cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture rt))
+        {
+            // Blit current camera render to our capture texture
+            var cmd = CommandBufferPool.Get("CaptureRGB");
+            cmd.Blit(BuiltinRenderTextureType.CameraTarget, rt);
+            context.ExecuteCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
+            
+            // Request async readback if not already pending
+            if (!pendingRGBRequests.ContainsKey(settings.cameraInstanceID) || 
+                pendingRGBRequests[settings.cameraInstanceID].done)
             {
-                try
+                if (settings.useAsyncCapture)
                 {
-                    switch (task.type)
-                    {
-                        case TaskType.Depth:
-                            PublishDepthToLCMBackground(task.depthData, task.width, task.height, task.metadata);
-                            break;
-                        case TaskType.RGB:
-                            PublishRGBToLCMBackground(task.data, task.width, task.height, task.metadata);
-                            break;
-                        case TaskType.CameraInfo:
-                            PublishCameraInfoBackground(task.cameraInfoData);
-                            break;
-                    }
+                    // Don't specify format - let it use the native format of the RenderTexture
+                    var request = AsyncGPUReadback.Request(rt, 0, 
+                        (AsyncGPUReadbackRequest r) => OnRGBReadbackComplete(r, settings));
+                    pendingRGBRequests[settings.cameraInstanceID] = request;
                 }
-                catch (Exception ex)
+                else
                 {
-                    Debug.LogError($"Background publish error: {ex.Message}");
+                    // Fallback to synchronous capture
+                    CaptureRGBSynchronous(rt, settings);
                 }
-            }
-            else
-            {
-                // No work available, sleep briefly
-                await Task.Delay(1, cancellationToken);
             }
         }
     }
@@ -312,7 +280,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     {
         if (lcm == null) return;
         
-        // Check for global capture key
+        // Check for capture keys
         if (Input.GetKeyDown(captureAllKey))
         {
             foreach (var settings in cameraSettings)
@@ -322,269 +290,55 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                     settings.captureRequested = true;
                 }
             }
-            if (debugMode) Debug.Log("Capture requested for all cameras");
         }
         
-        // Process each camera
+        // Check individual camera keys
         foreach (var settings in cameraSettings)
         {
             if (!settings.enabled || settings.camera == null) continue;
             
-            bool shouldCapture = false;
-            
-            // Check continuous mode (global or per-camera)
-            if (globalContinuousMode || settings.continuousMode)
-            {
-                if (Time.time >= settings.nextCaptureTime)
-                {
-                    float rate = globalContinuousMode ? globalPublishRate : settings.publishRate;
-                    settings.nextCaptureTime = Time.time + (1f / rate);
-                    shouldCapture = true;
-                }
-            }
-            
-            // Check individual camera key
             if (Input.GetKeyDown(settings.captureKey))
             {
-                shouldCapture = true;
-                if (debugMode) Debug.Log($"Capture requested for camera: {settings.camera.name}");
+                settings.captureRequested = true;
             }
             
-            // Check if capture was already requested
-            if (settings.captureRequested)
+            // Handle depth capture in Update (since we need to check for persistent depth texture)
+            if (settings.captureDepth)
             {
-                shouldCapture = true;
-                settings.captureRequested = false;
-            }
-            
-            if (shouldCapture)
-            {
-                // Skip if too many concurrent readbacks are active
-                if (useAsyncReadback && activeReadbacks >= maxConcurrentReadbacks)
+                bool shouldCaptureDepth = false;
+                
+                if (globalContinuousMode || settings.continuousMode)
                 {
-                    if (debugMode) Debug.Log($"Skipping capture for {settings.camera.name} - too many active readbacks");
-                    continue;
+                    if (Time.time >= settings.nextCaptureTime)
+                    {
+                        shouldCaptureDepth = true;
+                    }
                 }
                 
-                CaptureAndPublishAll(settings);
+                if (settings.captureRequested)
+                {
+                    shouldCaptureDepth = true;
+                }
+                
+                if (shouldCaptureDepth)
+                {
+                    CaptureDepthForCamera(settings);
+                }
             }
+        }
+        
+        // Process synchronous publishing if not using background thread
+        if (!useBackgroundThread)
+        {
+            ProcessPublishQueue();
         }
     }
     
-    private void CaptureAndPublishAll(CameraDepthSettings settings)
-    {
-        // Increment sequence number
-        settings.sequenceNumber++;
-        
-        // Capture and publish depth if enabled
-        if (settings.captureDepth)
-        {
-            if (useAsyncReadback)
-                CaptureDepthForCameraAsync(settings);
-            else
-                CaptureDepthForCamera(settings);
-        }
-        
-        // Capture and publish RGB if enabled
-        if (settings.captureRGB)
-        {
-            if (useAsyncReadback)
-                CaptureRGBForCameraAsync(settings);
-            else
-                CaptureRGBForCamera(settings);
-        }
-        
-        // Publish camera info if enabled (this is fast, so do it immediately)
-        if (settings.publishCameraInfo)
-        {
-            if (useBackgroundThreads)
-            {
-                // Pre-calculate camera info data on main thread
-                CameraInfoData cameraInfoData = CalculateCameraInfoData(settings);
-                
-                PublishTask task = new PublishTask
-                {
-                    type = TaskType.CameraInfo,
-                    cameraInfoData = cameraInfoData
-                };
-                publishQueue.Enqueue(task);
-            }
-            else
-            {
-                PublishCameraInfo(settings);
-            }
-        }
-    }
-    
-    private void CaptureDepthForCameraAsync(CameraDepthSettings settings)
-    {
-        // Get the persistent depth texture for this camera
-        RTHandle depthTexture = MultiCameraPersistentDepthFeature.GetPersistentDepthTexture(settings.cameraInstanceID);
-        
-        if (depthTexture == null || depthTexture.rt == null)
-        {
-            if (debugMode)
-            {
-                Debug.LogWarning($"Persistent depth texture not available for camera: {settings.camera.name}");
-            }
-            return;
-        }
-        
-        Texture sourceTexture = depthTexture.rt;
-        
-        if (sourceTexture.width <= 4 || sourceTexture.height <= 4)
-        {
-            if (debugMode)
-            {
-                Debug.LogWarning($"Invalid depth texture size for camera {settings.camera.name}: {sourceTexture.width}x{sourceTexture.height}");
-            }
-            return;
-        }
-        
-        // Create temp RT for depth data
-        RenderTexture tempRT = RenderTexture.GetTemporary(sourceTexture.width, sourceTexture.height, 0, RenderTextureFormat.RFloat);
-        Graphics.Blit(sourceTexture, tempRT);
-        
-        // Start async readback
-        Interlocked.Increment(ref activeReadbacks);
-        
-        AsyncGPUReadback.Request(tempRT, 0, TextureFormat.RFloat, (AsyncGPUReadbackRequest request) =>
-        {
-            Interlocked.Decrement(ref activeReadbacks);
-            RenderTexture.ReleaseTemporary(tempRT);
-            
-            if (request.hasError)
-            {
-                Debug.LogError($"Async GPU readback error for depth texture: {settings.camera.name}");
-                return;
-            }
-            
-            try
-            {
-                // Process depth data in background thread
-                var rawData = request.GetData<float>();
-                float[] depthArray = new float[rawData.Length];
-                rawData.CopyTo(depthArray);
-                
-                // Linearize depth values
-                float[] linearDepthValues = LinearizeDepthValues(depthArray, settings.camera);
-                
-                if (useBackgroundThreads)
-                {
-                    PublishTask task = new PublishTask
-                    {
-                        type = TaskType.Depth,
-                        depthData = linearDepthValues,
-                        width = sourceTexture.width,
-                        height = sourceTexture.height,
-                        metadata = new PublishMetadata
-                        {
-                            topicName = settings.depthTopicName,
-                            frameId = settings.depthFrameID,
-                            sequenceNumber = settings.sequenceNumber,
-                            encoding = depthEncoding
-                        }
-                    };
-                    publishQueue.Enqueue(task);
-                }
-                else
-                {
-                    PublishMetadata metadata = new PublishMetadata
-                    {
-                        topicName = settings.depthTopicName,
-                        frameId = settings.depthFrameID,
-                        sequenceNumber = settings.sequenceNumber,
-                        encoding = depthEncoding
-                    };
-                    PublishDepthToLCMBackground(linearDepthValues, sourceTexture.width, sourceTexture.height, metadata);
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"Error processing async depth readback: {ex.Message}");
-            }
-        });
-    }
-    
-    private void CaptureRGBForCameraAsync(CameraDepthSettings settings)
-    {
-        if (!cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture renderTexture))
-        {
-            if (debugMode)
-                Debug.LogWarning($"RGB render texture not found for camera: {settings.camera.name}");
-            return;
-        }
-        
-        // Store original target texture
-        RenderTexture originalTarget = settings.camera.targetTexture;
-        
-        // Temporarily set camera to render to our capture texture
-        settings.camera.targetTexture = renderTexture;
-        settings.camera.Render();
-        
-        // Restore original target
-        settings.camera.targetTexture = originalTarget;
-        
-        // Start async readback
-        Interlocked.Increment(ref activeReadbacks);
-        
-        AsyncGPUReadback.Request(renderTexture, 0, TextureFormat.RGB24, (AsyncGPUReadbackRequest request) =>
-        {
-            Interlocked.Decrement(ref activeReadbacks);
-            
-            if (request.hasError)
-            {
-                Debug.LogError($"Async GPU readback error for RGB texture: {settings.camera.name}");
-                return;
-            }
-            
-            try
-            {
-                // Get RGB data
-                var rawData = request.GetData<byte>();
-                byte[] rgbArray = new byte[rawData.Length];
-                rawData.CopyTo(rgbArray);
-                
-                if (useBackgroundThreads)
-                {
-                    PublishTask task = new PublishTask
-                    {
-                        type = TaskType.RGB,
-                        data = rgbArray,
-                        width = renderTexture.width,
-                        height = renderTexture.height,
-                        metadata = new PublishMetadata
-                        {
-                            topicName = settings.rgbTopicName,
-                            frameId = settings.rgbFrameID,
-                            sequenceNumber = settings.sequenceNumber,
-                            encoding = rgbEncoding
-                        }
-                    };
-                    publishQueue.Enqueue(task);
-                }
-                else
-                {
-                    PublishMetadata metadata = new PublishMetadata
-                    {
-                        topicName = settings.rgbTopicName,
-                        frameId = settings.rgbFrameID,
-                        sequenceNumber = settings.sequenceNumber,
-                        encoding = rgbEncoding
-                    };
-                    PublishRGBToLCMBackground(rgbArray, renderTexture.width, renderTexture.height, metadata);
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"Error processing async RGB readback: {ex.Message}");
-            }
-        });
-    }
-    
-    // Legacy synchronous methods (kept for fallback)
     private void CaptureDepthForCamera(CameraDepthSettings settings)
     {
+        // Skip if queue is full
+        if (skipFramesWhenBehind && publishQueue.Count > maxQueueSize) return;
+        
         RTHandle depthTexture = MultiCameraPersistentDepthFeature.GetPersistentDepthTexture(settings.cameraInstanceID);
         
         if (depthTexture == null || depthTexture.rt == null)
@@ -594,42 +348,208 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             return;
         }
         
-        Texture sourceTexture = depthTexture.rt;
-        if (sourceTexture.width <= 4 || sourceTexture.height <= 4) return;
+        // Check if async request is already pending
+        if (pendingDepthRequests.ContainsKey(settings.cameraInstanceID) && 
+            !pendingDepthRequests[settings.cameraInstanceID].done)
+        {
+            return; // Skip this frame
+        }
         
-        CaptureAndPublishDepth(sourceTexture, settings);
+        Texture sourceTexture = depthTexture.rt;
+        
+        if (settings.useAsyncCapture)
+        {
+            // Create temporary RT for async readback if downsampling
+            if (settings.downsampleFactor > 1)
+            {
+                int width = sourceTexture.width / settings.downsampleFactor;
+                int height = sourceTexture.height / settings.downsampleFactor;
+                RenderTexture tempRT = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.RFloat);
+                Graphics.Blit(sourceTexture, tempRT);
+                
+                var request = AsyncGPUReadback.Request(tempRT, 0,
+                    (AsyncGPUReadbackRequest r) => {
+                        RenderTexture.ReleaseTemporary(tempRT);
+                        OnDepthReadbackComplete(r, settings);
+                    });
+                pendingDepthRequests[settings.cameraInstanceID] = request;
+            }
+            else
+            {
+                var request = AsyncGPUReadback.Request(sourceTexture, 0,
+                    (AsyncGPUReadbackRequest r) => OnDepthReadbackComplete(r, settings));
+                pendingDepthRequests[settings.cameraInstanceID] = request;
+            }
+        }
+        else
+        {
+            CaptureDepthSynchronous(sourceTexture, settings);
+        }
+        
+        // Publish camera info (lightweight, can do immediately)
+        if (settings.publishCameraInfo)
+        {
+            PublishCameraInfo(settings);
+        }
+        
+        // Increment sequence number
+        settings.sequenceNumber++;
     }
     
-    private void CaptureRGBForCamera(CameraDepthSettings settings)
+    private void OnDepthReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings)
     {
-        if (!cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture renderTexture))
+        if (request.hasError)
         {
-            if (debugMode)
-                Debug.LogWarning($"RGB render texture not found for camera: {settings.camera.name}");
+            Debug.LogError($"Async depth readback failed for camera {settings.camera.name}");
             return;
         }
         
-        RenderTexture originalTarget = settings.camera.targetTexture;
-        settings.camera.targetTexture = renderTexture;
-        settings.camera.Render();
-        settings.camera.targetTexture = originalTarget;
-        
-        CaptureAndPublishRGB(renderTexture, settings);
+        try
+        {
+            var data = request.GetData<float>();
+            int width = request.width;
+            int height = request.height;
+            int expectedLength = width * height;
+            int actualLength = data.Length;
+            
+            if (debugMode && actualLength != expectedLength)
+            {
+                Debug.LogWarning($"Depth data length mismatch for {settings.camera.name}: expected {expectedLength}, got {actualLength}");
+            }
+            
+            // Get pooled array that matches the expected size
+            float[] depthArray = GetPooledFloatArray(expectedLength);
+            
+            // Copy data safely
+            int copyLength = Math.Min(actualLength, expectedLength);
+            for (int i = 0; i < copyLength; i++)
+            {
+                depthArray[i] = data[i];
+            }
+            
+            // Fill any remaining with far plane value if necessary
+            if (copyLength < expectedLength)
+            {
+                float farValue = settings.camera.farClipPlane;
+                for (int i = copyLength; i < expectedLength; i++)
+                {
+                    depthArray[i] = 1.0f; // Will be linearized to far plane
+                }
+            }
+            
+            // Linearize depth values
+            LinearizeDepthValuesInPlace(depthArray, settings.camera);
+            
+            // Queue for publishing
+            var publishData = new PublishData
+            {
+                Type = PublishData.DataType.Depth,
+                DepthData = depthArray,
+                Width = width,
+                Height = height,
+                Settings = settings
+            };
+            
+            publishQueue.Enqueue(publishData);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Error processing depth readback for camera {settings.camera.name}: {ex.Message}");
+        }
     }
     
-    private void CaptureAndPublishDepth(Texture sourceTexture, CameraDepthSettings settings)
+    private void OnRGBReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings)
     {
-        int width = sourceTexture.width;
-        int height = sourceTexture.height;
+        if (request.hasError)
+        {
+            Debug.LogError($"Async RGB readback failed for camera {settings.camera.name}");
+            return;
+        }
+        
+        int width = request.width;
+        int height = request.height;
+        byte[] rgbArray = null;
+        
+        try
+        {
+            // Get the raw data
+            var data = request.GetData<byte>();
+            int totalBytes = data.Length;
+            int expectedPixels = width * height;
+            int bytesPerPixel = totalBytes / expectedPixels;
+            
+            if (debugMode)
+            {
+                Debug.Log($"RGB Readback - Width: {width}, Height: {height}, Total bytes: {totalBytes}, Bytes per pixel: {bytesPerPixel}");
+            }
+            
+            if (bytesPerPixel == 3)
+            {
+                // Already RGB24, just copy
+                rgbArray = GetPooledByteArray(totalBytes);
+                data.CopyTo(rgbArray);
+            }
+            else if (bytesPerPixel == 4)
+            {
+                // ARGB32 or RGBA32, need to convert to RGB24
+                rgbArray = GetPooledByteArray(width * height * 3);
+                int srcIndex = 0;
+                int dstIndex = 0;
+                
+                // Check if it's ARGB or RGBA by examining a few pixels
+                // In Unity, it's typically RGBA32 format
+                for (int i = 0; i < expectedPixels; i++)
+                {
+                    // RGBA32 format: R, G, B, A
+                    rgbArray[dstIndex++] = data[srcIndex];     // R
+                    rgbArray[dstIndex++] = data[srcIndex + 1]; // G
+                    rgbArray[dstIndex++] = data[srcIndex + 2]; // B
+                    srcIndex += 4; // Skip alpha
+                }
+            }
+            else
+            {
+                // Unexpected format - try to handle gracefully
+                Debug.LogError($"Unexpected bytes per pixel: {bytesPerPixel} for camera {settings.camera.name}. Total bytes: {totalBytes}, Expected pixels: {expectedPixels}");
+                
+                // Try to salvage what we can
+                rgbArray = GetPooledByteArray(width * height * 3);
+                int copyLength = Math.Min(totalBytes, rgbArray.Length);
+                for (int i = 0; i < copyLength; i++)
+                {
+                    rgbArray[i] = data[i];
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Error processing RGB readback for camera {settings.camera.name}: {ex.Message}");
+            return;
+        }
+        
+        // Queue for publishing
+        var publishData = new PublishData
+        {
+            Type = PublishData.DataType.RGB,
+            Data = rgbArray,
+            Width = width,
+            Height = height,
+            Settings = settings
+        };
+        
+        publishQueue.Enqueue(publishData);
+    }
+    
+    private void CaptureDepthSynchronous(Texture sourceTexture, CameraDepthSettings settings)
+    {
+        int width = sourceTexture.width / settings.downsampleFactor;
+        int height = sourceTexture.height / settings.downsampleFactor;
         
         RenderTexture tempRT = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.RFloat);
         Graphics.Blit(sourceTexture, tempRT);
         
         RenderTexture.active = tempRT;
-        Texture2D depthImage = pooledDepthTextures.ContainsKey(settings.cameraInstanceID) 
-            ? pooledDepthTextures[settings.cameraInstanceID] 
-            : new Texture2D(width, height, TextureFormat.RFloat, false);
-        
+        Texture2D depthImage = new Texture2D(width, height, TextureFormat.RFloat, false);
         depthImage.ReadPixels(new Rect(0, 0, width, height), 0, 0);
         depthImage.Apply();
         RenderTexture.active = null;
@@ -637,58 +557,116 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         Color[] rawDepthPixels = depthImage.GetPixels();
         float[] linearDepthValues = LinearizeDepthValues(rawDepthPixels, settings.camera);
         
-        PublishDepthToLCM(linearDepthValues, width, height, settings);
+        var publishData = new PublishData
+        {
+            Type = PublishData.DataType.Depth,
+            DepthData = linearDepthValues,
+            Width = width,
+            Height = height,
+            Settings = settings
+        };
+        
+        if (useBackgroundThread)
+            publishQueue.Enqueue(publishData);
+        else
+            PublishDepthToLCM(publishData);
         
         RenderTexture.ReleaseTemporary(tempRT);
-        if (!pooledDepthTextures.ContainsKey(settings.cameraInstanceID))
-            DestroyImmediate(depthImage);
+        DestroyImmediate(depthImage);
     }
     
-    private void CaptureAndPublishRGB(RenderTexture sourceTexture, CameraDepthSettings settings)
+    private void CaptureRGBSynchronous(RenderTexture sourceTexture, CameraDepthSettings settings)
     {
-        int width = sourceTexture.width;
-        int height = sourceTexture.height;
-        
         RenderTexture.active = sourceTexture;
-        Texture2D rgbImage = pooledRGBTextures.ContainsKey(settings.cameraInstanceID)
-            ? pooledRGBTextures[settings.cameraInstanceID]
-            : new Texture2D(width, height, TextureFormat.RGB24, false);
-        
-        rgbImage.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+        Texture2D rgbImage = new Texture2D(sourceTexture.width, sourceTexture.height, TextureFormat.RGB24, false);
+        rgbImage.ReadPixels(new Rect(0, 0, sourceTexture.width, sourceTexture.height), 0, 0);
         rgbImage.Apply();
         RenderTexture.active = null;
         
         byte[] rgbData = rgbImage.GetRawTextureData();
-        PublishRGBToLCM(rgbData, width, height, settings);
         
-        if (!pooledRGBTextures.ContainsKey(settings.cameraInstanceID))
-            DestroyImmediate(rgbImage);
+        var publishData = new PublishData
+        {
+            Type = PublishData.DataType.RGB,
+            Data = rgbData,
+            Width = sourceTexture.width,
+            Height = sourceTexture.height,
+            Settings = settings
+        };
+        
+        if (useBackgroundThread)
+            publishQueue.Enqueue(publishData);
+        else
+            PublishRGBToLCM(publishData);
+        
+        DestroyImmediate(rgbImage);
+    }
+    
+    private void PublishThreadWorker()
+    {
+        while (isRunning)
+        {
+            ProcessPublishQueue();
+            Thread.Sleep(1); // Small sleep to prevent CPU spinning
+        }
+    }
+    
+    private void ProcessPublishQueue()
+    {
+        int processed = 0;
+        while (publishQueue.TryDequeue(out PublishData data) && processed < 5) // Process up to 5 items per frame
+        {
+            try
+            {
+                switch (data.Type)
+                {
+                    case PublishData.DataType.Depth:
+                        PublishDepthToLCM(data);
+                        break;
+                    case PublishData.DataType.RGB:
+                        PublishRGBToLCM(data);
+                        break;
+                    case PublishData.DataType.CameraInfo:
+                        lcm.Publish(data.Settings.cameraInfoTopicName, data.CameraInfo);
+                        break;
+                }
+                processed++;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Error publishing data: {ex.Message}");
+            }
+            finally
+            {
+                // Return arrays to pool
+                if (data.Data != null)
+                    ReturnByteArrayToPool(data.Data);
+                if (data.DepthData != null)
+                    ReturnFloatArrayToPool(data.DepthData);
+            }
+        }
+    }
+    
+    private void LinearizeDepthValuesInPlace(float[] depthValues, Camera camera)
+    {
+        float near = camera.nearClipPlane;
+        float far = camera.farClipPlane;
+        
+        for (int i = 0; i < depthValues.Length; i++)
+        {
+            depthValues[i] = CorrectPerspectiveLinearization(depthValues[i], near, far);
+        }
     }
     
     private float[] LinearizeDepthValues(Color[] rawDepthPixels, Camera camera)
     {
         float near = camera.nearClipPlane;
         float far = camera.farClipPlane;
-        float[] linearDepths = new float[rawDepthPixels.Length];
+        float[] linearDepths = GetPooledFloatArray(rawDepthPixels.Length);
         
         for (int i = 0; i < rawDepthPixels.Length; i++)
         {
-            float rawDepth = rawDepthPixels[i].r;
-            linearDepths[i] = CorrectPerspectiveLinearization(rawDepth, near, far);
-        }
-        
-        return linearDepths;
-    }
-    
-    private float[] LinearizeDepthValues(float[] rawDepthValues, Camera camera)
-    {
-        float near = camera.nearClipPlane;
-        float far = camera.farClipPlane;
-        float[] linearDepths = new float[rawDepthValues.Length];
-        
-        for (int i = 0; i < rawDepthValues.Length; i++)
-        {
-            linearDepths[i] = CorrectPerspectiveLinearization(rawDepthValues[i], near, far);
+            linearDepths[i] = CorrectPerspectiveLinearization(rawDepthPixels[i].r, near, far);
         }
         
         return linearDepths;
@@ -696,16 +674,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     
     private float CorrectPerspectiveLinearization(float rawDepth, float near, float far)
     {
-        float depth01;
-        
-        if (SystemInfo.usesReversedZBuffer)
-        {
-            depth01 = 1.0f - rawDepth;
-        }
-        else
-        {
-            depth01 = rawDepth;
-        }
+        float depth01 = SystemInfo.usesReversedZBuffer ? (1.0f - rawDepth) : rawDepth;
         
         if (depth01 <= 0.0001f) return near;
         if (depth01 >= 0.9999f) return far;
@@ -714,130 +683,68 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         return Mathf.Clamp(linearDepth, near, far * 2.0f);
     }
     
-    private void PublishDepthToLCM(float[] depthValues, int width, int height, CameraDepthSettings settings)
+    private void PublishDepthToLCM(PublishData data)
     {
-        if (useBackgroundThreads)
+        var imageMsg = new sensor_msgs.Image();
+        imageMsg.header = CreateHeader(data.Settings.sequenceNumber, data.Settings.depthFrameID);
+        imageMsg.height = data.Height;
+        imageMsg.width = data.Width;
+        imageMsg.encoding = depthEncoding;
+        imageMsg.is_bigendian = BitConverter.IsLittleEndian ? (byte)0 : (byte)1;
+        imageMsg.step = data.Width * sizeof(float);
+        
+        int dataSize = data.DepthData.Length * sizeof(float);
+        imageMsg.data = GetPooledByteArray(dataSize);
+        imageMsg.data_length = dataSize;
+        
+        Buffer.BlockCopy(data.DepthData, 0, imageMsg.data, 0, dataSize);
+        
+        lcm.Publish(data.Settings.depthTopicName, imageMsg);
+        
+        // Return byte array to pool after publishing
+        ReturnByteArrayToPool(imageMsg.data);
+    }
+    
+    private void PublishRGBToLCM(PublishData data)
+    {
+        var imageMsg = new sensor_msgs.Image();
+        imageMsg.header = CreateHeader(data.Settings.sequenceNumber, data.Settings.rgbFrameID);
+        imageMsg.height = data.Height;
+        imageMsg.width = data.Width;
+        imageMsg.encoding = rgbEncoding;
+        imageMsg.is_bigendian = BitConverter.IsLittleEndian ? (byte)0 : (byte)1;
+        imageMsg.step = data.Width * 3;
+        imageMsg.data = data.Data;
+        imageMsg.data_length = data.Data.Length;
+        
+        lcm.Publish(data.Settings.rgbTopicName, imageMsg);
+    }
+    
+    private void PublishCameraInfo(CameraDepthSettings settings)
+    {
+        var cameraInfoMsg = CreateCameraInfoMessage(settings);
+        
+        if (useBackgroundThread)
         {
-            PublishTask task = new PublishTask
+            var publishData = new PublishData
             {
-                type = TaskType.Depth,
-                depthData = depthValues,
-                width = width,
-                height = height,
-                metadata = new PublishMetadata
-                {
-                    topicName = settings.depthTopicName,
-                    frameId = settings.depthFrameID,
-                    sequenceNumber = settings.sequenceNumber,
-                    encoding = depthEncoding
-                }
+                Type = PublishData.DataType.CameraInfo,
+                CameraInfo = cameraInfoMsg,
+                Settings = settings
             };
-            publishQueue.Enqueue(task);
+            publishQueue.Enqueue(publishData);
         }
         else
         {
-            PublishMetadata metadata = new PublishMetadata
-            {
-                topicName = settings.depthTopicName,
-                frameId = settings.depthFrameID,
-                sequenceNumber = settings.sequenceNumber,
-                encoding = depthEncoding
-            };
-            PublishDepthToLCMBackground(depthValues, width, height, metadata);
+            lcm.Publish(settings.cameraInfoTopicName, cameraInfoMsg);
         }
     }
     
-    private void PublishRGBToLCM(byte[] rgbData, int width, int height, CameraDepthSettings settings)
+    private sensor_msgs.CameraInfo CreateCameraInfoMessage(CameraDepthSettings settings)
     {
-        if (useBackgroundThreads)
-        {
-            PublishTask task = new PublishTask
-            {
-                type = TaskType.RGB,
-                data = rgbData,
-                width = width,
-                height = height,
-                metadata = new PublishMetadata
-                {
-                    topicName = settings.rgbTopicName,
-                    frameId = settings.rgbFrameID,
-                    sequenceNumber = settings.sequenceNumber,
-                    encoding = rgbEncoding
-                }
-            };
-            publishQueue.Enqueue(task);
-        }
-        else
-        {
-            PublishMetadata metadata = new PublishMetadata
-            {
-                topicName = settings.rgbTopicName,
-                frameId = settings.rgbFrameID,
-                sequenceNumber = settings.sequenceNumber,
-                encoding = rgbEncoding
-            };
-            PublishRGBToLCMBackground(rgbData, width, height, metadata);
-        }
-    }
-    
-    private void PublishDepthToLCMBackground(float[] depthValues, int width, int height, PublishMetadata metadata)
-    {
-        try
-        {
-            sensor_msgs.Image imageMsg = new sensor_msgs.Image();
-            imageMsg.header = CreateHeaderBackground(metadata.sequenceNumber, metadata.frameId);
-            imageMsg.height = height;
-            imageMsg.width = width;
-            imageMsg.encoding = metadata.encoding;
-            imageMsg.is_bigendian = BitConverter.IsLittleEndian ? (byte)0 : (byte)1;
-            imageMsg.step = width * sizeof(float);
-            
-            int dataSize = depthValues.Length * sizeof(float);
-            imageMsg.data = new byte[dataSize];
-            imageMsg.data_length = dataSize;
-            
-            Buffer.BlockCopy(depthValues, 0, imageMsg.data, 0, dataSize);
-            
-            lcm.Publish(metadata.topicName, imageMsg);
-            
-            if (debugMode)
-                Debug.Log($"Published depth image ({width}x{height}) to topic: {metadata.topicName}");
-        }
-        catch (Exception ex)
-        {
-            Debug.LogError($"Error publishing depth: {ex.Message}");
-        }
-    }
-    
-    private void PublishRGBToLCMBackground(byte[] rgbData, int width, int height, PublishMetadata metadata)
-    {
-        try
-        {
-            sensor_msgs.Image imageMsg = new sensor_msgs.Image();
-            imageMsg.header = CreateHeaderBackground(metadata.sequenceNumber, metadata.frameId);
-            imageMsg.height = height;
-            imageMsg.width = width;
-            imageMsg.encoding = metadata.encoding;
-            imageMsg.is_bigendian = BitConverter.IsLittleEndian ? (byte)0 : (byte)1;
-            imageMsg.step = width * 3;
-            
-            imageMsg.data = rgbData;
-            imageMsg.data_length = rgbData.Length;
-            
-            lcm.Publish(metadata.topicName, imageMsg);
-            
-            if (debugMode)
-                Debug.Log($"Published RGB image ({width}x{height}) to topic: {metadata.topicName}");
-        }
-        catch (Exception ex)
-        {
-            Debug.LogError($"Error publishing RGB: {ex.Message}");
-        }
-    }
-    
-    private CameraInfoData CalculateCameraInfoData(CameraDepthSettings settings)
-    {
-        // Get image dimensions (use RGB dimensions if RGB is enabled, otherwise use camera resolution)
+        var cameraInfoMsg = new sensor_msgs.CameraInfo();
+        cameraInfoMsg.header = CreateHeader(settings.sequenceNumber, settings.cameraInfoFrameID);
+        
         int width, height;
         if (settings.captureRGB && cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture rt))
         {
@@ -846,11 +753,16 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         }
         else
         {
-            width = settings.camera.pixelWidth > 0 ? settings.camera.pixelWidth : settings.rgbWidth;
-            height = settings.camera.pixelHeight > 0 ? settings.camera.pixelHeight : settings.rgbHeight;
+            width = (settings.camera.pixelWidth > 0 ? settings.camera.pixelWidth : settings.rgbWidth) / settings.downsampleFactor;
+            height = (settings.camera.pixelHeight > 0 ? settings.camera.pixelHeight : settings.rgbHeight) / settings.downsampleFactor;
         }
         
-        // Calculate intrinsic matrix from Unity camera parameters
+        cameraInfoMsg.height = height;
+        cameraInfoMsg.width = width;
+        cameraInfoMsg.distortion_model = "plumb_bob";
+        cameraInfoMsg.D_length = 5;
+        cameraInfoMsg.D = new double[5] { 0.0, 0.0, 0.0, 0.0, 0.0 };
+        
         float fovY = settings.camera.fieldOfView * Mathf.Deg2Rad;
         float fovX = 2.0f * Mathf.Atan(Mathf.Tan(fovY * 0.5f) * settings.camera.aspect);
         float fy = height / (2.0f * Mathf.Tan(fovY * 0.5f));
@@ -858,100 +770,37 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         float cx = width * 0.5f;
         float cy = height * 0.5f;
         
-        return new CameraInfoData
-        {
-            width = width,
-            height = height,
-            fx = fx,
-            fy = fy,
-            cx = cx,
-            cy = cy,
-            sequenceNumber = settings.sequenceNumber,
-            frameId = settings.cameraInfoFrameID,
-            topicName = settings.cameraInfoTopicName
-        };
-    }
-    
-    private void PublishCameraInfo(CameraDepthSettings settings)
-    {
-        if (useBackgroundThreads)
-        {
-            // Pre-calculate camera info data on main thread
-            CameraInfoData cameraInfoData = CalculateCameraInfoData(settings);
-            
-            PublishTask task = new PublishTask
-            {
-                type = TaskType.CameraInfo,
-                cameraInfoData = cameraInfoData
-            };
-            publishQueue.Enqueue(task);
-        }
-        else
-        {
-            PublishCameraInfoBackground(CalculateCameraInfoData(settings));
-        }
-    }
-    
-    private void PublishCameraInfoBackground(CameraInfoData cameraInfoData)
-    {
-        try
-        {
-            sensor_msgs.CameraInfo cameraInfoMsg = new sensor_msgs.CameraInfo();
-            cameraInfoMsg.header = CreateHeaderBackground(cameraInfoData.sequenceNumber, cameraInfoData.frameId);
-            
-            cameraInfoMsg.height = cameraInfoData.height;
-            cameraInfoMsg.width = cameraInfoData.width;
-            cameraInfoMsg.distortion_model = "plumb_bob";
-            cameraInfoMsg.D_length = 5;
-            cameraInfoMsg.D = new double[5] { 0.0, 0.0, 0.0, 0.0, 0.0 };
-            
-            cameraInfoMsg.K[0] = cameraInfoData.fx; cameraInfoMsg.K[1] = 0;  cameraInfoMsg.K[2] = cameraInfoData.cx;
-            cameraInfoMsg.K[3] = 0;  cameraInfoMsg.K[4] = cameraInfoData.fy; cameraInfoMsg.K[5] = cameraInfoData.cy;
-            cameraInfoMsg.K[6] = 0;  cameraInfoMsg.K[7] = 0;  cameraInfoMsg.K[8] = 1;
-            
-            cameraInfoMsg.R[0] = 1; cameraInfoMsg.R[1] = 0; cameraInfoMsg.R[2] = 0;
-            cameraInfoMsg.R[3] = 0; cameraInfoMsg.R[4] = 1; cameraInfoMsg.R[5] = 0;
-            cameraInfoMsg.R[6] = 0; cameraInfoMsg.R[7] = 0; cameraInfoMsg.R[8] = 1;
-            
-            cameraInfoMsg.P[0] = cameraInfoData.fx; cameraInfoMsg.P[1] = 0;  cameraInfoMsg.P[2] = cameraInfoData.cx; cameraInfoMsg.P[3] = 0;
-            cameraInfoMsg.P[4] = 0;  cameraInfoMsg.P[5] = cameraInfoData.fy; cameraInfoMsg.P[6] = cameraInfoData.cy; cameraInfoMsg.P[7] = 0;
-            cameraInfoMsg.P[8] = 0;  cameraInfoMsg.P[9] = 0;  cameraInfoMsg.P[10] = 1; cameraInfoMsg.P[11] = 0;
-            
-            cameraInfoMsg.binning_x = 0;
-            cameraInfoMsg.binning_y = 0;
-            
-            cameraInfoMsg.roi = new sensor_msgs.RegionOfInterest();
-            cameraInfoMsg.roi.x_offset = 0;
-            cameraInfoMsg.roi.y_offset = 0;
-            cameraInfoMsg.roi.height = (int)cameraInfoData.height;
-            cameraInfoMsg.roi.width = (int)cameraInfoData.width;
-            cameraInfoMsg.roi.do_rectify = false;
-            
-            lcm.Publish(cameraInfoData.topicName, cameraInfoMsg);
-            
-            if (debugMode)
-                Debug.Log($"Published camera info to topic: {cameraInfoData.topicName}");
-        }
-        catch (Exception ex)
-        {
-            Debug.LogError($"Error publishing camera info: {ex.Message}");
-        }
-    }
-    
-    private std_msgs.Header CreateHeaderBackground(uint sequenceNumber, string frameId)
-    {
-        std_msgs.Header header = new std_msgs.Header();
-        header.seq = (int)sequenceNumber;
-        header.stamp = new std_msgs.Time();
-        header.stamp.sec = (int)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        header.stamp.nsec = (int)((DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() % 1000) * 1000000);
-        header.frame_id = frameId;
-        return header;
+        // Set K matrix
+        cameraInfoMsg.K[0] = fx; cameraInfoMsg.K[1] = 0;  cameraInfoMsg.K[2] = cx;
+        cameraInfoMsg.K[3] = 0;  cameraInfoMsg.K[4] = fy; cameraInfoMsg.K[5] = cy;
+        cameraInfoMsg.K[6] = 0;  cameraInfoMsg.K[7] = 0;  cameraInfoMsg.K[8] = 1;
+        
+        // Set R matrix (identity)
+        cameraInfoMsg.R[0] = 1; cameraInfoMsg.R[1] = 0; cameraInfoMsg.R[2] = 0;
+        cameraInfoMsg.R[3] = 0; cameraInfoMsg.R[4] = 1; cameraInfoMsg.R[5] = 0;
+        cameraInfoMsg.R[6] = 0; cameraInfoMsg.R[7] = 0; cameraInfoMsg.R[8] = 1;
+        
+        // Set P matrix
+        cameraInfoMsg.P[0] = fx; cameraInfoMsg.P[1] = 0;  cameraInfoMsg.P[2] = cx; cameraInfoMsg.P[3] = 0;
+        cameraInfoMsg.P[4] = 0;  cameraInfoMsg.P[5] = fy; cameraInfoMsg.P[6] = cy; cameraInfoMsg.P[7] = 0;
+        cameraInfoMsg.P[8] = 0;  cameraInfoMsg.P[9] = 0;  cameraInfoMsg.P[10] = 1; cameraInfoMsg.P[11] = 0;
+        
+        cameraInfoMsg.binning_x = 0;
+        cameraInfoMsg.binning_y = 0;
+        
+        cameraInfoMsg.roi = new sensor_msgs.RegionOfInterest();
+        cameraInfoMsg.roi.x_offset = 0;
+        cameraInfoMsg.roi.y_offset = 0;
+        cameraInfoMsg.roi.height = height;
+        cameraInfoMsg.roi.width = width;
+        cameraInfoMsg.roi.do_rectify = false;
+        
+        return cameraInfoMsg;
     }
     
     private std_msgs.Header CreateHeader(uint sequenceNumber, string frameId)
     {
-        std_msgs.Header header = new std_msgs.Header();
+        var header = new std_msgs.Header();
         header.seq = (int)sequenceNumber;
         header.stamp = new std_msgs.Time();
         header.stamp.sec = (int)DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -960,20 +809,66 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         return header;
     }
     
-    void OnDisable()
+    // Object pooling methods
+    private byte[] GetPooledByteArray(int size)
     {
-        // Cancel background threads
-        if (cancellationTokenSource != null)
+        lock (byteArrayPool)
         {
-            cancellationTokenSource.Cancel();
-            
-            if (backgroundTasks != null)
+            if (byteArrayPool.Count > 0)
             {
-                Task.WaitAll(backgroundTasks, 1000); // Wait up to 1 second
+                var array = byteArrayPool.Dequeue();
+                if (array.Length >= size)
+                    return array;
             }
+            return new byte[size];
+        }
+    }
+    
+    private float[] GetPooledFloatArray(int size)
+    {
+        lock (floatArrayPool)
+        {
+            if (floatArrayPool.Count > 0)
+            {
+                var array = floatArrayPool.Dequeue();
+                if (array.Length >= size)
+                    return array;
+            }
+            return new float[size];
+        }
+    }
+    
+    private void ReturnByteArrayToPool(byte[] array)
+    {
+        if (array == null) return;
+        lock (byteArrayPool)
+        {
+            if (byteArrayPool.Count < 20) // Keep pool size reasonable
+                byteArrayPool.Enqueue(array);
+        }
+    }
+    
+    private void ReturnFloatArrayToPool(float[] array)
+    {
+        if (array == null) return;
+        lock (floatArrayPool)
+        {
+            if (floatArrayPool.Count < 20) // Keep pool size reasonable
+                floatArrayPool.Enqueue(array);
+        }
+    }
+    
+    void OnDestroy()
+    {
+        isRunning = false;
+        
+        if (publishThread != null)
+        {
+            publishThread.Join(1000);
         }
         
-        // Clean up
+        RenderPipelineManager.endCameraRendering -= OnCameraRendering;
+        
         foreach (var settings in cameraSettings)
         {
             if (settings.camera != null)
@@ -991,26 +886,14 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             }
         }
         cameraRenderTextures.Clear();
-        
-        foreach (var kvp in pooledDepthTextures)
-        {
-            if (kvp.Value != null)
-                DestroyImmediate(kvp.Value);
-        }
-        pooledDepthTextures.Clear();
-        
-        foreach (var kvp in pooledRGBTextures)
-        {
-            if (kvp.Value != null)
-                DestroyImmediate(kvp.Value);
-        }
-        pooledRGBTextures.Clear();
     }
     
+    // Public API methods
     public void AddCamera(Camera camera, string depthTopic = null, string rgbTopic = null, string cameraInfoTopic = null)
     {
         if (camera == null) return;
         
+        // Check if camera already exists
         foreach (var existing in cameraSettings)
         {
             if (existing.camera == camera) return;
@@ -1028,11 +911,17 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         newSettings.rgbFrameID = $"{baseName}_rgb_optical_frame";
         newSettings.cameraInfoFrameID = $"{baseName}_optical_frame";
         
-        camera.depthTextureMode = DepthTextureMode.Depth;
-        SetupCameraRenderTexture(newSettings);
+        // Enable depth texture
+        if (newSettings.captureDepth)
+        {
+            camera.depthTextureMode = DepthTextureMode.Depth;
+        }
         
-        if (useAsyncReadback)
-            SetupPooledTextures(newSettings);
+        // Setup RGB capture
+        if (newSettings.captureRGB)
+        {
+            SetupCameraRenderTexture(newSettings);
+        }
         
         cameraSettings.Add(newSettings);
         
@@ -1050,8 +939,10 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             {
                 var settings = cameraSettings[i];
                 
+                // Clean up depth texture
                 MultiCameraPersistentDepthFeature.CleanupCameraDepthTexture(settings.cameraInstanceID);
                 
+                // Clean up RGB render texture
                 if (cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture rt))
                 {
                     if (rt != null)
@@ -1060,18 +951,6 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                         DestroyImmediate(rt);
                     }
                     cameraRenderTextures.Remove(settings.cameraInstanceID);
-                }
-                
-                if (pooledDepthTextures.TryGetValue(settings.cameraInstanceID, out Texture2D depthTex))
-                {
-                    if (depthTex != null) DestroyImmediate(depthTex);
-                    pooledDepthTextures.Remove(settings.cameraInstanceID);
-                }
-                
-                if (pooledRGBTextures.TryGetValue(settings.cameraInstanceID, out Texture2D rgbTex))
-                {
-                    if (rgbTex != null) DestroyImmediate(rgbTex);
-                    pooledRGBTextures.Remove(settings.cameraInstanceID);
                 }
                 
                 cameraSettings.RemoveAt(i);
