@@ -20,7 +20,7 @@ public class LCMTestScript : MonoBehaviour
                 // Debug.Log("Positions: " + string.Join(", ", jointStateMessage.position));
             }
             // sleep for a short time to simulate processing delay
-            System.Threading.Thread.Sleep(10); // Sleep for 10 milliseconds
+            System.Threading.Thread.Sleep(1); // Sleep for 10 milliseconds
         }
     }
     void Start()
@@ -41,7 +41,7 @@ public class LCMTestScript : MonoBehaviour
                 Debug.Log("Found " + articulationBodies.Length + " articulation bodies");
                 
             // Initialize LCM with a try-catch to catch any network issues
-            lcm = new LCM.LCM.LCM("udpm://239.255.76.67:7667");
+            lcm = new LCM.LCM.LCM("udpm://239.255.76.67:7667?ttl=1");
             
             // Set up subscriber
             lcm.SubscribeAll(new SimpleSubscriber());

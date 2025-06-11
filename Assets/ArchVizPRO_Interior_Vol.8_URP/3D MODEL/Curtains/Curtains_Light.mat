@@ -13,6 +13,9 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   version: 11
+  hdPluginSubTargetMaterialVersions:
+    m_Keys: []
+    m_Values: 
 --- !u!114 &-5053742520947376867
 MonoBehaviour:
   m_ObjectHideFlags: 11
@@ -36,20 +39,15 @@ Material:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_Name: Curtains_Light
-  m_Shader: {fileID: 4800000, guid: 8e8edc1d8d2b3714dabdd66aaace7775, type: 3}
+  m_Shader: {fileID: -6465566751694194690, guid: 6bed474871bbb7be1ac15f02b34fa9c6, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords: []
-  m_InvalidKeywords:
-  - _DISABLE_SSR_TRANSPARENT
-  - _DOUBLESIDED_ON
-  - _ENABLE_FOG_ON_TRANSPARENT
-  - _SURFACE_TYPE_TRANSPARENT
-  - _TRANSPARENT_WRITES_MOTION_VEC
+  m_InvalidKeywords: []
   m_LightmapFlags: 4
   m_EnableInstancingVariants: 0
   m_DoubleSidedGI: 1
-  m_CustomRenderQueue: 2750
+  m_CustomRenderQueue: -1
   stringTagMap:
     MotionVector: User
   disabledShaderPasses:

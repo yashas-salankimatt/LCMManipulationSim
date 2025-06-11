@@ -13,6 +13,9 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   version: 11
+  hdPluginSubTargetMaterialVersions:
+    m_Keys: []
+    m_Values: 
 --- !u!114 &-7444033648613183259
 MonoBehaviour:
   m_ObjectHideFlags: 11
@@ -49,17 +52,15 @@ Material:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_Name: Bed_Bedroom_Fabric_Cover2
-  m_Shader: {fileID: 4800000, guid: 693e7627737f5a34cb28af1b44715ca1, type: 3}
+  m_Shader: {fileID: -6465566751694194690, guid: 076193e43afbca87386b630f25fb6bb4, type: 3}
   m_Parent: {fileID: 0}
   m_ModifiedSerializedProperties: 0
   m_ValidKeywords: []
-  m_InvalidKeywords:
-  - _DISABLE_SSR_TRANSPARENT
-  - _DOUBLESIDED_ON
+  m_InvalidKeywords: []
   m_LightmapFlags: 4
   m_EnableInstancingVariants: 0
   m_DoubleSidedGI: 1
-  m_CustomRenderQueue: 2225
+  m_CustomRenderQueue: -1
   stringTagMap:
     MotionVector: User
   disabledShaderPasses:

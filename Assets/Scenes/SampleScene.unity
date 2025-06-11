@@ -93,7 +93,7 @@ LightmapSettings:
     m_ExportTrainingData: 0
     m_TrainingDataDestination: TrainingData
     m_LightProbeSampleCountMultiplier: 4
-  m_LightingDataAsset: {fileID: 112000000, guid: 2666be44160a34b20873fe8ba85782e6, type: 2}
+  m_LightingDataAsset: {fileID: 112000000, guid: b746835826b04975294ec0abe8d1fc1c, type: 2}
   m_LightingSettings: {fileID: 4890085278179872738, guid: 4eeb802dc30d54977aad78a1ad46a543, type: 2}
 --- !u!196 &4
 NavMeshSettings:
@@ -406,11 +406,11 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   debugMode: 0
-  useAsyncReadback: 1
+  useAsyncReadback: 0
   maxConcurrentReadbacks: 10
-  useBackgroundThreads: 1
+  useBackgroundThreads: 0
   backgroundThreadCount: 4
-  lcmURL: udpm://239.255.76.67:7667
+  lcmURL: udpm://239.255.76.67:7667?ttl=1
   depthEncoding: 32FC1
   rgbEncoding: rgb8
   cameraSettings:
@@ -458,7 +458,7 @@ MonoBehaviour:
     sequenceNumber: 0
   captureAllKey: 32
   globalContinuousMode: 1
-  globalPublishRate: 10
+  globalPublishRate: 5
 --- !u!1 &5460940
 GameObject:
   m_ObjectHideFlags: 0

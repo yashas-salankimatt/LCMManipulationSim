@@ -84,12 +84,20 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     private struct PublishTask
     {
         public TaskType type;
-        public CameraDepthSettings settings;
         public byte[] data;
         public int width;
         public int height;
         public float[] depthData; // For depth tasks
         public CameraInfoData cameraInfoData; // For camera info tasks
+        public PublishMetadata metadata; // Topic names, frame IDs, etc.
+    }
+    
+    private struct PublishMetadata
+    {
+        public string topicName;
+        public string frameId;
+        public uint sequenceNumber;
+        public string encoding;
     }
     
     private struct CameraInfoData
@@ -277,10 +285,10 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                     switch (task.type)
                     {
                         case TaskType.Depth:
-                            PublishDepthToLCMBackground(task.depthData, task.width, task.height, task.settings);
+                            PublishDepthToLCMBackground(task.depthData, task.width, task.height, task.metadata);
                             break;
                         case TaskType.RGB:
-                            PublishRGBToLCMBackground(task.data, task.width, task.height, task.settings);
+                            PublishRGBToLCMBackground(task.data, task.width, task.height, task.metadata);
                             break;
                         case TaskType.CameraInfo:
                             PublishCameraInfoBackground(task.cameraInfoData);
@@ -397,7 +405,6 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 PublishTask task = new PublishTask
                 {
                     type = TaskType.CameraInfo,
-                    settings = settings,
                     cameraInfoData = cameraInfoData
                 };
                 publishQueue.Enqueue(task);
@@ -467,16 +474,29 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                     PublishTask task = new PublishTask
                     {
                         type = TaskType.Depth,
-                        settings = settings,
                         depthData = linearDepthValues,
                         width = sourceTexture.width,
-                        height = sourceTexture.height
+                        height = sourceTexture.height,
+                        metadata = new PublishMetadata
+                        {
+                            topicName = settings.depthTopicName,
+                            frameId = settings.depthFrameID,
+                            sequenceNumber = settings.sequenceNumber,
+                            encoding = depthEncoding
+                        }
                     };
                     publishQueue.Enqueue(task);
                 }
                 else
                 {
-                    PublishDepthToLCMBackground(linearDepthValues, sourceTexture.width, sourceTexture.height, settings);
+                    PublishMetadata metadata = new PublishMetadata
+                    {
+                        topicName = settings.depthTopicName,
+                        frameId = settings.depthFrameID,
+                        sequenceNumber = settings.sequenceNumber,
+                        encoding = depthEncoding
+                    };
+                    PublishDepthToLCMBackground(linearDepthValues, sourceTexture.width, sourceTexture.height, metadata);
                 }
             }
             catch (Exception ex)
@@ -530,16 +550,29 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                     PublishTask task = new PublishTask
                     {
                         type = TaskType.RGB,
-                        settings = settings,
                         data = rgbArray,
                         width = renderTexture.width,
-                        height = renderTexture.height
+                        height = renderTexture.height,
+                        metadata = new PublishMetadata
+                        {
+                            topicName = settings.rgbTopicName,
+                            frameId = settings.rgbFrameID,
+                            sequenceNumber = settings.sequenceNumber,
+                            encoding = rgbEncoding
+                        }
                     };
                     publishQueue.Enqueue(task);
                 }
                 else
                 {
-                    PublishRGBToLCMBackground(rgbArray, renderTexture.width, renderTexture.height, settings);
+                    PublishMetadata metadata = new PublishMetadata
+                    {
+                        topicName = settings.rgbTopicName,
+                        frameId = settings.rgbFrameID,
+                        sequenceNumber = settings.sequenceNumber,
+                        encoding = rgbEncoding
+                    };
+                    PublishRGBToLCMBackground(rgbArray, renderTexture.width, renderTexture.height, metadata);
                 }
             }
             catch (Exception ex)
@@ -688,16 +721,29 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             PublishTask task = new PublishTask
             {
                 type = TaskType.Depth,
-                settings = settings,
                 depthData = depthValues,
                 width = width,
-                height = height
+                height = height,
+                metadata = new PublishMetadata
+                {
+                    topicName = settings.depthTopicName,
+                    frameId = settings.depthFrameID,
+                    sequenceNumber = settings.sequenceNumber,
+                    encoding = depthEncoding
+                }
             };
             publishQueue.Enqueue(task);
         }
         else
         {
-            PublishDepthToLCMBackground(depthValues, width, height, settings);
+            PublishMetadata metadata = new PublishMetadata
+            {
+                topicName = settings.depthTopicName,
+                frameId = settings.depthFrameID,
+                sequenceNumber = settings.sequenceNumber,
+                encoding = depthEncoding
+            };
+            PublishDepthToLCMBackground(depthValues, width, height, metadata);
         }
     }
     
@@ -708,28 +754,41 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             PublishTask task = new PublishTask
             {
                 type = TaskType.RGB,
-                settings = settings,
                 data = rgbData,
                 width = width,
-                height = height
+                height = height,
+                metadata = new PublishMetadata
+                {
+                    topicName = settings.rgbTopicName,
+                    frameId = settings.rgbFrameID,
+                    sequenceNumber = settings.sequenceNumber,
+                    encoding = rgbEncoding
+                }
             };
             publishQueue.Enqueue(task);
         }
         else
         {
-            PublishRGBToLCMBackground(rgbData, width, height, settings);
+            PublishMetadata metadata = new PublishMetadata
+            {
+                topicName = settings.rgbTopicName,
+                frameId = settings.rgbFrameID,
+                sequenceNumber = settings.sequenceNumber,
+                encoding = rgbEncoding
+            };
+            PublishRGBToLCMBackground(rgbData, width, height, metadata);
         }
     }
     
-    private void PublishDepthToLCMBackground(float[] depthValues, int width, int height, CameraDepthSettings settings)
+    private void PublishDepthToLCMBackground(float[] depthValues, int width, int height, PublishMetadata metadata)
     {
         try
         {
             sensor_msgs.Image imageMsg = new sensor_msgs.Image();
-            imageMsg.header = CreateHeader(settings.sequenceNumber, settings.depthFrameID);
+            imageMsg.header = CreateHeaderBackground(metadata.sequenceNumber, metadata.frameId);
             imageMsg.height = height;
             imageMsg.width = width;
-            imageMsg.encoding = depthEncoding;
+            imageMsg.encoding = metadata.encoding;
             imageMsg.is_bigendian = BitConverter.IsLittleEndian ? (byte)0 : (byte)1;
             imageMsg.step = width * sizeof(float);
             
@@ -739,10 +798,10 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             
             Buffer.BlockCopy(depthValues, 0, imageMsg.data, 0, dataSize);
             
-            lcm.Publish(settings.depthTopicName, imageMsg);
+            lcm.Publish(metadata.topicName, imageMsg);
             
             if (debugMode)
-                Debug.Log($"Published depth image ({width}x{height}) for {settings.camera.name}");
+                Debug.Log($"Published depth image ({width}x{height}) to topic: {metadata.topicName}");
         }
         catch (Exception ex)
         {
@@ -750,25 +809,25 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         }
     }
     
-    private void PublishRGBToLCMBackground(byte[] rgbData, int width, int height, CameraDepthSettings settings)
+    private void PublishRGBToLCMBackground(byte[] rgbData, int width, int height, PublishMetadata metadata)
     {
         try
         {
             sensor_msgs.Image imageMsg = new sensor_msgs.Image();
-            imageMsg.header = CreateHeader(settings.sequenceNumber, settings.rgbFrameID);
+            imageMsg.header = CreateHeaderBackground(metadata.sequenceNumber, metadata.frameId);
             imageMsg.height = height;
             imageMsg.width = width;
-            imageMsg.encoding = rgbEncoding;
+            imageMsg.encoding = metadata.encoding;
             imageMsg.is_bigendian = BitConverter.IsLittleEndian ? (byte)0 : (byte)1;
             imageMsg.step = width * 3;
             
             imageMsg.data = rgbData;
             imageMsg.data_length = rgbData.Length;
             
-            lcm.Publish(settings.rgbTopicName, imageMsg);
+            lcm.Publish(metadata.topicName, imageMsg);
             
             if (debugMode)
-                Debug.Log($"Published RGB image ({width}x{height}) for {settings.camera.name}");
+                Debug.Log($"Published RGB image ({width}x{height}) to topic: {metadata.topicName}");
         }
         catch (Exception ex)
         {
@@ -823,7 +882,6 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             PublishTask task = new PublishTask
             {
                 type = TaskType.CameraInfo,
-                settings = settings,
                 cameraInfoData = cameraInfoData
             };
             publishQueue.Enqueue(task);
