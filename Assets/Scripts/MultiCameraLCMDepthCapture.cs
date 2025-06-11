@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Threading;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using GrayWolf.GPUInstancing.Domain;
 
 [System.Serializable]
@@ -69,24 +70,25 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     [SerializeField] private bool globalContinuousMode = false;
     [SerializeField] private float globalPublishRate = 10f;
     
-    [Header("Performance")]
-    [SerializeField] private bool useBackgroundThread = true;
-    [SerializeField] private int maxQueueSize = 10;
+    [Header("Enhanced Performance")]
+    [SerializeField] private int numPublishThreads = 3; // Multiple publisher threads
+    [SerializeField] private int maxQueueSize = 20; // Increased queue size
     [SerializeField] private bool skipFramesWhenBehind = true;
+    [SerializeField] private bool useOptimizedRGBConversion = true;
     
     private LCM.LCM.LCM lcm;
     private Dictionary<int, RenderTexture> cameraRenderTextures = new Dictionary<int, RenderTexture>();
     private Dictionary<int, AsyncGPUReadbackRequest> pendingDepthRequests = new Dictionary<int, AsyncGPUReadbackRequest>();
     private Dictionary<int, AsyncGPUReadbackRequest> pendingRGBRequests = new Dictionary<int, AsyncGPUReadbackRequest>();
     
-    // Background thread for LCM publishing
-    private Thread publishThread;
+    // Multiple publishing threads for better throughput
+    private Thread[] publishThreads;
     private ConcurrentQueue<PublishData> publishQueue = new ConcurrentQueue<PublishData>();
-    private bool isRunning = true;
+    private volatile bool isRunning = true;
     
-    // Object pooling for memory efficiency
-    private Queue<byte[]> byteArrayPool = new Queue<byte[]>();
-    private Queue<float[]> floatArrayPool = new Queue<float[]>();
+    // Enhanced object pooling with larger pools
+    private ConcurrentQueue<byte[]> byteArrayPool = new ConcurrentQueue<byte[]>();
+    private ConcurrentQueue<float[]> floatArrayPool = new ConcurrentQueue<float[]>();
     
     private class PublishData
     {
@@ -137,7 +139,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 settings.camera.depthTextureMode = DepthTextureMode.Depth;
             }
             
-            // Subscribe to render pipeline callbacks for RGB capture (avoids Camera.Render())
+            // Subscribe to render pipeline callbacks for RGB capture
             if (settings.captureRGB)
             {
                 SetupCameraRenderTexture(settings);
@@ -155,11 +157,13 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         {
             lcm = new LCM.LCM.LCM(lcmURL);
             
-            // Start background publishing thread
-            if (useBackgroundThread)
+            // Start multiple publishing threads for better throughput
+            publishThreads = new Thread[numPublishThreads];
+            for (int i = 0; i < numPublishThreads; i++)
             {
-                publishThread = new Thread(PublishThreadWorker);
-                publishThread.Start();
+                publishThreads[i] = new Thread(() => PublishThreadWorker($"Publisher-{i}"));
+                publishThreads[i].Name = $"LCM-Publisher-{i}";
+                publishThreads[i].Start();
             }
             
             // Subscribe to render pipeline events for RGB capture
@@ -168,7 +172,8 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             if (debugMode)
             {
                 Debug.Log($"LCM initialized with URL: {lcmURL}");
-                Debug.Log($"Background thread: {useBackgroundThread}");
+                Debug.Log($"Publisher threads: {numPublishThreads}");
+                Debug.Log($"Optimized RGB conversion: {useOptimizedRGBConversion}");
             }
         }
         catch (Exception ex)
@@ -247,7 +252,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             return;
         }
         
-        // Capture RGB using the camera's current render (no extra Camera.Render() call!)
+        // Capture RGB using the camera's current render
         if (cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture rt))
         {
             // Blit current camera render to our capture texture
@@ -262,14 +267,12 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             {
                 if (settings.useAsyncCapture)
                 {
-                    // Don't specify format - let it use the native format of the RenderTexture
                     var request = AsyncGPUReadback.Request(rt, 0, 
                         (AsyncGPUReadbackRequest r) => OnRGBReadbackComplete(r, settings));
                     pendingRGBRequests[settings.cameraInstanceID] = request;
                 }
                 else
                 {
-                    // Fallback to synchronous capture
                     CaptureRGBSynchronous(rt, settings);
                 }
             }
@@ -302,7 +305,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 settings.captureRequested = true;
             }
             
-            // Handle depth capture in Update (since we need to check for persistent depth texture)
+            // Handle depth capture in Update
             if (settings.captureDepth)
             {
                 bool shouldCaptureDepth = false;
@@ -327,10 +330,10 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             }
         }
         
-        // Process synchronous publishing if not using background thread
-        if (!useBackgroundThread)
+        // Display queue status in debug mode
+        if (debugMode && Time.frameCount % 60 == 0) // Every 60 frames
         {
-            ProcessPublishQueue();
+            Debug.Log($"Publish queue size: {publishQueue.Count}");
         }
     }
     
@@ -412,25 +415,16 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             int expectedLength = width * height;
             int actualLength = data.Length;
             
-            if (debugMode && actualLength != expectedLength)
-            {
-                Debug.LogWarning($"Depth data length mismatch for {settings.camera.name}: expected {expectedLength}, got {actualLength}");
-            }
-            
             // Get pooled array that matches the expected size
             float[] depthArray = GetPooledFloatArray(expectedLength);
             
-            // Copy data safely
+            // Copy data safely using NativeArray.Copy which is faster
             int copyLength = Math.Min(actualLength, expectedLength);
-            for (int i = 0; i < copyLength; i++)
-            {
-                depthArray[i] = data[i];
-            }
+            NativeArray<float>.Copy(data, depthArray, copyLength);
             
             // Fill any remaining with far plane value if necessary
             if (copyLength < expectedLength)
             {
-                float farValue = settings.camera.farClipPlane;
                 for (int i = copyLength; i < expectedLength; i++)
                 {
                     depthArray[i] = 1.0f; // Will be linearized to far plane
@@ -468,76 +462,114 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         
         int width = request.width;
         int height = request.height;
-        byte[] rgbArray = null;
+        int pixelCount = width * height;
         
         try
         {
-            // Get the raw data
             var data = request.GetData<byte>();
             int totalBytes = data.Length;
-            int expectedPixels = width * height;
-            int bytesPerPixel = totalBytes / expectedPixels;
+            int bytesPerPixel = totalBytes / pixelCount;
             
-            if (debugMode)
+            if (debugMode && bytesPerPixel != 4)
             {
-                Debug.Log($"RGB Readback - Width: {width}, Height: {height}, Total bytes: {totalBytes}, Bytes per pixel: {bytesPerPixel}");
+                Debug.LogWarning($"Expected 4 bytes per pixel, got {bytesPerPixel} for {settings.camera.name}");
             }
+            
+            byte[] rgbArray = null;
             
             if (bytesPerPixel == 3)
             {
                 // Already RGB24, just copy
                 rgbArray = GetPooledByteArray(totalBytes);
-                data.CopyTo(rgbArray);
+                NativeArray<byte>.Copy(data, rgbArray, totalBytes);
             }
             else if (bytesPerPixel == 4)
             {
-                // ARGB32 or RGBA32, need to convert to RGB24
-                rgbArray = GetPooledByteArray(width * height * 3);
-                int srcIndex = 0;
-                int dstIndex = 0;
+                // RGBA32 to RGB24 conversion
+                rgbArray = GetPooledByteArray(pixelCount * 3);
                 
-                // Check if it's ARGB or RGBA by examining a few pixels
-                // In Unity, it's typically RGBA32 format
-                for (int i = 0; i < expectedPixels; i++)
+                if (useOptimizedRGBConversion)
                 {
-                    // RGBA32 format: R, G, B, A
-                    rgbArray[dstIndex++] = data[srcIndex];     // R
-                    rgbArray[dstIndex++] = data[srcIndex + 1]; // G
-                    rgbArray[dstIndex++] = data[srcIndex + 2]; // B
-                    srcIndex += 4; // Skip alpha
+                    // Use optimized unsafe conversion
+                    ConvertRGBAToRGBOptimized(data, rgbArray, pixelCount);
+                }
+                else
+                {
+                    // Fallback to safe conversion
+                    ConvertRGBAToRGBSafe(data, rgbArray, pixelCount);
                 }
             }
             else
             {
-                // Unexpected format - try to handle gracefully
-                Debug.LogError($"Unexpected bytes per pixel: {bytesPerPixel} for camera {settings.camera.name}. Total bytes: {totalBytes}, Expected pixels: {expectedPixels}");
-                
-                // Try to salvage what we can
-                rgbArray = GetPooledByteArray(width * height * 3);
-                int copyLength = Math.Min(totalBytes, rgbArray.Length);
-                for (int i = 0; i < copyLength; i++)
-                {
-                    rgbArray[i] = data[i];
-                }
+                Debug.LogError($"Unsupported bytes per pixel: {bytesPerPixel}");
+                return;
             }
+            
+            // Queue for publishing
+            var publishData = new PublishData
+            {
+                Type = PublishData.DataType.RGB,
+                Data = rgbArray,
+                Width = width,
+                Height = height,
+                Settings = settings
+            };
+            
+            publishQueue.Enqueue(publishData);
         }
         catch (Exception ex)
         {
             Debug.LogError($"Error processing RGB readback for camera {settings.camera.name}: {ex.Message}");
-            return;
         }
-        
-        // Queue for publishing
-        var publishData = new PublishData
+    }
+    
+    private unsafe void ConvertRGBAToRGBOptimized(NativeArray<byte> rgba, byte[] rgb, int pixelCount)
+    {
+        fixed (byte* rgbPtr = rgb)
         {
-            Type = PublishData.DataType.RGB,
-            Data = rgbArray,
-            Width = width,
-            Height = height,
-            Settings = settings
-        };
+            byte* rgbaPtr = (byte*)rgba.GetUnsafeReadOnlyPtr();
+            byte* dstPtr = rgbPtr;
+            byte* srcPtr = rgbaPtr;
+            
+            // Process 8 pixels at a time for better vectorization
+            int fullGroups = pixelCount / 8;
+            int remainder = pixelCount % 8;
+            
+            for (int i = 0; i < fullGroups; i++)
+            {
+                // Unroll loop for 8 pixels
+                for (int j = 0; j < 8; j++)
+                {
+                    *dstPtr++ = *srcPtr++;     // R
+                    *dstPtr++ = *srcPtr++;     // G
+                    *dstPtr++ = *srcPtr++;     // B
+                    srcPtr++;                  // Skip A
+                }
+            }
+            
+            // Handle remaining pixels
+            for (int i = 0; i < remainder; i++)
+            {
+                *dstPtr++ = *srcPtr++;     // R
+                *dstPtr++ = *srcPtr++;     // G
+                *dstPtr++ = *srcPtr++;     // B
+                srcPtr++;                  // Skip A
+            }
+        }
+    }
+    
+    private void ConvertRGBAToRGBSafe(NativeArray<byte> rgba, byte[] rgb, int pixelCount)
+    {
+        int srcIndex = 0;
+        int dstIndex = 0;
         
-        publishQueue.Enqueue(publishData);
+        for (int i = 0; i < pixelCount; i++)
+        {
+            rgb[dstIndex++] = rgba[srcIndex++];     // R
+            rgb[dstIndex++] = rgba[srcIndex++];     // G
+            rgb[dstIndex++] = rgba[srcIndex++];     // B
+            srcIndex++;                             // Skip A
+        }
     }
     
     private void CaptureDepthSynchronous(Texture sourceTexture, CameraDepthSettings settings)
@@ -566,10 +598,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             Settings = settings
         };
         
-        if (useBackgroundThread)
-            publishQueue.Enqueue(publishData);
-        else
-            PublishDepthToLCM(publishData);
+        publishQueue.Enqueue(publishData);
         
         RenderTexture.ReleaseTemporary(tempRT);
         DestroyImmediate(depthImage);
@@ -594,57 +623,62 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             Settings = settings
         };
         
-        if (useBackgroundThread)
-            publishQueue.Enqueue(publishData);
-        else
-            PublishRGBToLCM(publishData);
+        publishQueue.Enqueue(publishData);
         
         DestroyImmediate(rgbImage);
     }
     
-    private void PublishThreadWorker()
+    private void PublishThreadWorker(string threadName)
     {
+        if (debugMode)
+            Debug.Log($"Started {threadName}");
+        
         while (isRunning)
         {
-            ProcessPublishQueue();
-            Thread.Sleep(1); // Small sleep to prevent CPU spinning
-        }
-    }
-    
-    private void ProcessPublishQueue()
-    {
-        int processed = 0;
-        while (publishQueue.TryDequeue(out PublishData data) && processed < 5) // Process up to 5 items per frame
-        {
-            try
+            bool processedAny = false;
+            
+            // Process items without artificial limits
+            while (publishQueue.TryDequeue(out PublishData data))
             {
-                switch (data.Type)
+                try
                 {
-                    case PublishData.DataType.Depth:
-                        PublishDepthToLCM(data);
-                        break;
-                    case PublishData.DataType.RGB:
-                        PublishRGBToLCM(data);
-                        break;
-                    case PublishData.DataType.CameraInfo:
-                        lcm.Publish(data.Settings.cameraInfoTopicName, data.CameraInfo);
-                        break;
+                    switch (data.Type)
+                    {
+                        case PublishData.DataType.Depth:
+                            PublishDepthToLCM(data);
+                            break;
+                        case PublishData.DataType.RGB:
+                            PublishRGBToLCM(data);
+                            break;
+                        case PublishData.DataType.CameraInfo:
+                            lcm.Publish(data.Settings.cameraInfoTopicName, data.CameraInfo);
+                            break;
+                    }
+                    processedAny = true;
                 }
-                processed++;
+                catch (Exception ex)
+                {
+                    Debug.LogError($"Error publishing data in {threadName}: {ex.Message}");
+                }
+                finally
+                {
+                    // Return arrays to pool
+                    if (data.Data != null)
+                        ReturnByteArrayToPool(data.Data);
+                    if (data.DepthData != null)
+                        ReturnFloatArrayToPool(data.DepthData);
+                }
             }
-            catch (Exception ex)
+            
+            if (!processedAny)
             {
-                Debug.LogError($"Error publishing data: {ex.Message}");
-            }
-            finally
-            {
-                // Return arrays to pool
-                if (data.Data != null)
-                    ReturnByteArrayToPool(data.Data);
-                if (data.DepthData != null)
-                    ReturnFloatArrayToPool(data.DepthData);
+                // More efficient wait when queue is empty
+                Thread.Yield();
             }
         }
+        
+        if (debugMode)
+            Debug.Log($"Stopped {threadName}");
     }
     
     private void LinearizeDepthValuesInPlace(float[] depthValues, Camera camera)
@@ -724,20 +758,13 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
     {
         var cameraInfoMsg = CreateCameraInfoMessage(settings);
         
-        if (useBackgroundThread)
+        var publishData = new PublishData
         {
-            var publishData = new PublishData
-            {
-                Type = PublishData.DataType.CameraInfo,
-                CameraInfo = cameraInfoMsg,
-                Settings = settings
-            };
-            publishQueue.Enqueue(publishData);
-        }
-        else
-        {
-            lcm.Publish(settings.cameraInfoTopicName, cameraInfoMsg);
-        }
+            Type = PublishData.DataType.CameraInfo,
+            CameraInfo = cameraInfoMsg,
+            Settings = settings
+        };
+        publishQueue.Enqueue(publishData);
     }
     
     private sensor_msgs.CameraInfo CreateCameraInfoMessage(CameraDepthSettings settings)
@@ -809,62 +836,53 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         return header;
     }
     
-    // Object pooling methods
+    // Enhanced object pooling with better performance
     private byte[] GetPooledByteArray(int size)
     {
-        lock (byteArrayPool)
+        if (byteArrayPool.TryDequeue(out byte[] array))
         {
-            if (byteArrayPool.Count > 0)
-            {
-                var array = byteArrayPool.Dequeue();
-                if (array.Length >= size)
-                    return array;
-            }
-            return new byte[size];
+            if (array.Length >= size)
+                return array;
         }
+        return new byte[size];
     }
     
     private float[] GetPooledFloatArray(int size)
     {
-        lock (floatArrayPool)
+        if (floatArrayPool.TryDequeue(out float[] array))
         {
-            if (floatArrayPool.Count > 0)
-            {
-                var array = floatArrayPool.Dequeue();
-                if (array.Length >= size)
-                    return array;
-            }
-            return new float[size];
+            if (array.Length >= size)
+                return array;
         }
+        return new float[size];
     }
     
     private void ReturnByteArrayToPool(byte[] array)
     {
         if (array == null) return;
-        lock (byteArrayPool)
-        {
-            if (byteArrayPool.Count < 20) // Keep pool size reasonable
-                byteArrayPool.Enqueue(array);
-        }
+        if (byteArrayPool.Count < 50) // Larger pool size
+            byteArrayPool.Enqueue(array);
     }
     
     private void ReturnFloatArrayToPool(float[] array)
     {
         if (array == null) return;
-        lock (floatArrayPool)
-        {
-            if (floatArrayPool.Count < 20) // Keep pool size reasonable
-                floatArrayPool.Enqueue(array);
-        }
+        if (floatArrayPool.Count < 50) // Larger pool size
+            floatArrayPool.Enqueue(array);
     }
     
     void OnDestroy()
     {
         isRunning = false;
         
-        if (publishThread != null)
+        // Wait for all publishing threads to finish
+        if (publishThreads != null)
         {
-            publishThread.Join(1000);
+            foreach (var thread in publishThreads)
+            {
+                if (thread != null)
+                    thread.Join(1000);
+            }
         }
         
         RenderPipelineManager.endCameraRendering -= OnCameraRendering;
@@ -888,12 +906,11 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         cameraRenderTextures.Clear();
     }
     
-    // Public API methods
+    // Public API methods (unchanged)
     public void AddCamera(Camera camera, string depthTopic = null, string rgbTopic = null, string cameraInfoTopic = null)
     {
         if (camera == null) return;
         
-        // Check if camera already exists
         foreach (var existing in cameraSettings)
         {
             if (existing.camera == camera) return;
@@ -911,13 +928,11 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         newSettings.rgbFrameID = $"{baseName}_rgb_optical_frame";
         newSettings.cameraInfoFrameID = $"{baseName}_optical_frame";
         
-        // Enable depth texture
         if (newSettings.captureDepth)
         {
             camera.depthTextureMode = DepthTextureMode.Depth;
         }
         
-        // Setup RGB capture
         if (newSettings.captureRGB)
         {
             SetupCameraRenderTexture(newSettings);
@@ -939,10 +954,8 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             {
                 var settings = cameraSettings[i];
                 
-                // Clean up depth texture
                 MultiCameraPersistentDepthFeature.CleanupCameraDepthTexture(settings.cameraInstanceID);
                 
-                // Clean up RGB render texture
                 if (cameraRenderTextures.TryGetValue(settings.cameraInstanceID, out RenderTexture rt))
                 {
                     if (rt != null)
