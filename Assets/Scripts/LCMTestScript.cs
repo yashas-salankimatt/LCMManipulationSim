@@ -1,6 +1,7 @@
 using UnityEngine;
 using LCM.LCM;
 using System;
+using Mujoco;
 
 public class LCMTestScript : MonoBehaviour
 {
@@ -25,24 +26,25 @@ public class LCMTestScript : MonoBehaviour
     }
     void Start()
     {
+        
         try
         {
             Debug.Log("Starting LCM initialization...");
-            
+
             // Log information about URDF model and articulation bodies
             if (urdfModel == null)
                 Debug.LogError("URDF Model reference is null!");
             else
                 Debug.Log("URDF Model reference found: " + urdfModel.name);
-                
+
             if (articulationBodies == null || articulationBodies.Length == 0)
                 Debug.LogError("ArticulationBodies array is null or empty!");
             else
                 Debug.Log("Found " + articulationBodies.Length + " articulation bodies");
-                
+
             // Initialize LCM with a try-catch to catch any network issues
             lcm = new LCM.LCM.LCM("udpm://239.255.76.67:7667?ttl=1");
-            
+
             // Set up subscriber
             lcm.SubscribeAll(new SimpleSubscriber());
             Debug.Log("LCM initialized and subscriber set up successfully.");

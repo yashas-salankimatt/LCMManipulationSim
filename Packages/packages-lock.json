@@ -304,6 +304,12 @@
       },
       "url": "https://packages.unity.com"
     },
+    "org.mujoco": {
+      "version": "file:mujoco",
+      "depth": 0,
+      "source": "embedded",
+      "dependencies": {}
+    },
     "com.unity.modules.accessibility": {
       "version": "1.0.0",
       "depth": 0,

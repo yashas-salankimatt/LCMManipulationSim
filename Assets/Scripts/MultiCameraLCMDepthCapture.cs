@@ -576,6 +576,13 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             if (enablePerformanceTracking)
                 performanceTracker.RecordTime("Depth_DataCopy", copySw.Elapsed.TotalMilliseconds);
             
+            // FIXED: Flip depth data vertically to correct Unity's bottom-left origin
+            var flipSw = Stopwatch.StartNew();
+            FlipDepthDataVertically(depthArray, width, height);
+            flipSw.Stop();
+            if (enablePerformanceTracking)
+                performanceTracker.RecordTime("Depth_VerticalFlip", flipSw.Elapsed.TotalMilliseconds);
+            
             // Linearize depth values
             var linearizeSw = Stopwatch.StartNew();
             LinearizeDepthValuesInPlace(depthArray, settings.camera);
@@ -604,6 +611,24 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         totalSw.Stop();
         if (enablePerformanceTracking)
             performanceTracker.RecordTime("OnDepthReadbackComplete_Total", totalSw.Elapsed.TotalMilliseconds);
+    }
+    
+    // ADDED: Method to flip depth data vertically
+    private void FlipDepthDataVertically(float[] depthData, int width, int height)
+    {
+        for (int y = 0; y < height / 2; y++)
+        {
+            int topRowStart = y * width;
+            int bottomRowStart = (height - 1 - y) * width;
+            
+            for (int x = 0; x < width; x++)
+            {
+                // Swap pixels between top and bottom rows
+                float temp = depthData[topRowStart + x];
+                depthData[topRowStart + x] = depthData[bottomRowStart + x];
+                depthData[bottomRowStart + x] = temp;
+            }
+        }
     }
     
     private void OnRGBReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings, double captureStartTime)
@@ -768,7 +793,20 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         
         var processSw = Stopwatch.StartNew();
         Color[] rawDepthPixels = depthImage.GetPixels();
-        float[] linearDepthValues = LinearizeDepthValues(rawDepthPixels, settings.camera);
+        
+        // FIXED: Convert Color array to float array and flip vertically
+        float[] linearDepthValues = GetPooledFloatArray(rawDepthPixels.Length);
+        for (int i = 0; i < rawDepthPixels.Length; i++)
+        {
+            linearDepthValues[i] = rawDepthPixels[i].r;
+        }
+        
+        // Flip depth data vertically
+        FlipDepthDataVertically(linearDepthValues, width, height);
+        
+        // Linearize depth values
+        LinearizeDepthValuesInPlace(linearDepthValues, settings.camera);
+        
         processSw.Stop();
         if (enablePerformanceTracking)
             performanceTracker.RecordTime("Depth_SyncProcess", processSw.Elapsed.TotalMilliseconds);
