@@ -193,6 +193,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         public enum DataType { Depth, RGB, CameraInfo }
         public DataType Type;
         public byte[] Data;
+        public int ActualDataSize; // NEW: Track actual valid data size
         public float[] DepthData;
         public int Width;
         public int Height;
@@ -631,12 +632,19 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         }
     }
     
-    // Add this method to your MultiCameraLCMDepthCapture class
     // ADDED: Method to flip RGB data vertically (similar to depth data flipping)
-    private void FlipRGBDataVertically(byte[] rgbData, int width, int height)
+    private void FlipRGBDataVertically(byte[] rgbData, int width, int height, int actualDataSize)
     {
         int bytesPerPixel = 3; // RGB24 format
         int stride = width * bytesPerPixel;
+        
+        // Validate that we have the expected amount of data
+        int expectedSize = width * height * bytesPerPixel;
+        if (actualDataSize != expectedSize)
+        {
+            UnityEngine.Debug.LogWarning($"RGB data size mismatch: expected {expectedSize}, got {actualDataSize}");
+            return;
+        }
         
         // Create temporary row buffer
         byte[] tempRow = new byte[stride];
@@ -657,7 +665,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         }
     }
 
-    // Modified OnRGBReadbackComplete method - add flipping after RGB conversion
+    // Modified OnRGBReadbackComplete method - track actual data size
     private void OnRGBReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings, double captureStartTime)
     {
         var totalSw = Stopwatch.StartNew();
@@ -688,13 +696,15 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             }
             
             byte[] rgbArray = null;
+            int actualDataSize = 0; // NEW: Track the actual size of valid data
             
             if (bytesPerPixel == 3)
             {
                 var copySw = Stopwatch.StartNew();
                 // Already RGB24, just copy
-                rgbArray = GetPooledByteArray(totalBytes);
-                NativeArray<byte>.Copy(data, rgbArray, totalBytes);
+                actualDataSize = totalBytes; // 3 bytes per pixel
+                rgbArray = GetPooledByteArray(actualDataSize);
+                NativeArray<byte>.Copy(data, rgbArray, actualDataSize);
                 copySw.Stop();
                 if (enablePerformanceTracking)
                     performanceTracker.RecordTime("RGB_DirectCopy", copySw.Elapsed.TotalMilliseconds);
@@ -702,7 +712,8 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             else if (bytesPerPixel == 4)
             {
                 // RGBA32 to RGB24 conversion
-                rgbArray = GetPooledByteArray(pixelCount * 3);
+                actualDataSize = pixelCount * 3; // 3 bytes per pixel after conversion
+                rgbArray = GetPooledByteArray(actualDataSize);
                 
                 var conversionSw = Stopwatch.StartNew();
                 if (useOptimizedRGBConversion)
@@ -726,9 +737,9 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 return;
             }
             
-            // ADDED: Flip RGB data vertically to match depth data orientation
+            // Flip RGB data vertically to match depth data orientation
             var flipSw = Stopwatch.StartNew();
-            FlipRGBDataVertically(rgbArray, width, height);
+            FlipRGBDataVertically(rgbArray, width, height, actualDataSize); // Pass actual size
             flipSw.Stop();
             if (enablePerformanceTracking)
                 performanceTracker.RecordTime("RGB_VerticalFlip", flipSw.Elapsed.TotalMilliseconds);
@@ -738,6 +749,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
             {
                 Type = PublishData.DataType.RGB,
                 Data = rgbArray,
+                ActualDataSize = actualDataSize, // NEW: Set actual data size
                 Width = width,
                 Height = height,
                 Settings = settings,
@@ -881,13 +893,14 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         
         var dataSw = Stopwatch.StartNew();
         byte[] rgbData = rgbImage.GetRawTextureData();
+        int actualDataSize = rgbData.Length; // Should be width * height * 3
         dataSw.Stop();
         if (enablePerformanceTracking)
             performanceTracker.RecordTime("RGB_GetRawData", dataSw.Elapsed.TotalMilliseconds);
         
-        // ADDED: Flip RGB data vertically to match depth data orientation
+        // Flip RGB data vertically to match depth data orientation
         var flipSw = Stopwatch.StartNew();
-        FlipRGBDataVertically(rgbData, sourceTexture.width, sourceTexture.height);
+        FlipRGBDataVertically(rgbData, sourceTexture.width, sourceTexture.height, actualDataSize);
         flipSw.Stop();
         if (enablePerformanceTracking)
             performanceTracker.RecordTime("RGB_VerticalFlip_Sync", flipSw.Elapsed.TotalMilliseconds);
@@ -896,6 +909,7 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         {
             Type = PublishData.DataType.RGB,
             Data = rgbData,
+            ActualDataSize = actualDataSize, // NEW: Set actual data size
             Width = sourceTexture.width,
             Height = sourceTexture.height,
             Settings = settings,
@@ -1052,9 +1066,36 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         imageMsg.width = data.Width;
         imageMsg.encoding = rgbEncoding;
         imageMsg.is_bigendian = BitConverter.IsLittleEndian ? (byte)0 : (byte)1;
-        imageMsg.step = data.Width * 3;
-        imageMsg.data = data.Data;
-        imageMsg.data_length = data.Data.Length;
+        imageMsg.step = data.Width * 3; // 3 bytes per pixel for RGB
+        
+        // FIXED: Use actual data size instead of full array length
+        if (data.ActualDataSize > 0 && data.ActualDataSize <= data.Data.Length)
+        {
+            // Create a new array with only the valid data
+            byte[] validData = new byte[data.ActualDataSize];
+            Array.Copy(data.Data, 0, validData, 0, data.ActualDataSize);
+            imageMsg.data = validData;
+            imageMsg.data_length = data.ActualDataSize;
+        }
+        else
+        {
+            // Fallback to calculated size
+            int expectedSize = data.Width * data.Height * 3;
+            if (data.Data.Length >= expectedSize)
+            {
+                byte[] validData = new byte[expectedSize];
+                Array.Copy(data.Data, 0, validData, 0, expectedSize);
+                imageMsg.data = validData;
+                imageMsg.data_length = expectedSize;
+            }
+            else
+            {
+                UnityEngine.Debug.LogError($"RGB data array too small: expected {expectedSize}, got {data.Data.Length}");
+                imageMsg.data = data.Data;
+                imageMsg.data_length = data.Data.Length;
+            }
+        }
+        
         msgSw.Stop();
         if (enablePerformanceTracking)
             performanceTracker.RecordTime("RGB_MessageConstruction", msgSw.Elapsed.TotalMilliseconds);
