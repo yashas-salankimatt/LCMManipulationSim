@@ -631,6 +631,33 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         }
     }
     
+    // Add this method to your MultiCameraLCMDepthCapture class
+    // ADDED: Method to flip RGB data vertically (similar to depth data flipping)
+    private void FlipRGBDataVertically(byte[] rgbData, int width, int height)
+    {
+        int bytesPerPixel = 3; // RGB24 format
+        int stride = width * bytesPerPixel;
+        
+        // Create temporary row buffer
+        byte[] tempRow = new byte[stride];
+        
+        for (int y = 0; y < height / 2; y++)
+        {
+            int topRowStart = y * stride;
+            int bottomRowStart = (height - 1 - y) * stride;
+            
+            // Copy top row to temp
+            Array.Copy(rgbData, topRowStart, tempRow, 0, stride);
+            
+            // Copy bottom row to top
+            Array.Copy(rgbData, bottomRowStart, rgbData, topRowStart, stride);
+            
+            // Copy temp (original top) to bottom
+            Array.Copy(tempRow, 0, rgbData, bottomRowStart, stride);
+        }
+    }
+
+    // Modified OnRGBReadbackComplete method - add flipping after RGB conversion
     private void OnRGBReadbackComplete(AsyncGPUReadbackRequest request, CameraDepthSettings settings, double captureStartTime)
     {
         var totalSw = Stopwatch.StartNew();
@@ -698,6 +725,13 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 UnityEngine.Debug.LogError($"Unsupported bytes per pixel: {bytesPerPixel}");
                 return;
             }
+            
+            // ADDED: Flip RGB data vertically to match depth data orientation
+            var flipSw = Stopwatch.StartNew();
+            FlipRGBDataVertically(rgbArray, width, height);
+            flipSw.Stop();
+            if (enablePerformanceTracking)
+                performanceTracker.RecordTime("RGB_VerticalFlip", flipSw.Elapsed.TotalMilliseconds);
             
             // Queue for publishing
             var publishData = new PublishData
@@ -850,6 +884,13 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         dataSw.Stop();
         if (enablePerformanceTracking)
             performanceTracker.RecordTime("RGB_GetRawData", dataSw.Elapsed.TotalMilliseconds);
+        
+        // ADDED: Flip RGB data vertically to match depth data orientation
+        var flipSw = Stopwatch.StartNew();
+        FlipRGBDataVertically(rgbData, sourceTexture.width, sourceTexture.height);
+        flipSw.Stop();
+        if (enablePerformanceTracking)
+            performanceTracker.RecordTime("RGB_VerticalFlip_Sync", flipSw.Elapsed.TotalMilliseconds);
         
         var publishData = new PublishData
         {
