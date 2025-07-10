@@ -42,6 +42,7 @@ public class CameraDepthSettings
     public int rgbWidth = 640;
     public int rgbHeight = 480;
     public bool useNativeResolution = true;
+    public bool flipRGBVertically = true;
     
     [Header("Performance Settings")]
     public int downsampleFactor = 1; // 1 = full res, 2 = half res, etc.
@@ -737,12 +738,15 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
                 return;
             }
             
-            // Flip RGB data vertically to match depth data orientation
-            var flipSw = Stopwatch.StartNew();
-            FlipRGBDataVertically(rgbArray, width, height, actualDataSize); // Pass actual size
-            flipSw.Stop();
-            if (enablePerformanceTracking)
-                performanceTracker.RecordTime("RGB_VerticalFlip", flipSw.Elapsed.TotalMilliseconds);
+            // Flip RGB data vertically if enabled
+            if (settings.flipRGBVertically)
+            {
+                var flipSw = Stopwatch.StartNew();
+                FlipRGBDataVertically(rgbArray, width, height, actualDataSize); // Pass actual size
+                flipSw.Stop();
+                if (enablePerformanceTracking)
+                    performanceTracker.RecordTime("RGB_VerticalFlip", flipSw.Elapsed.TotalMilliseconds);
+            }
             
             // Queue for publishing
             var publishData = new PublishData
@@ -898,12 +902,15 @@ public class MultiCameraLCMDepthCapture : MonoBehaviour
         if (enablePerformanceTracking)
             performanceTracker.RecordTime("RGB_GetRawData", dataSw.Elapsed.TotalMilliseconds);
         
-        // Flip RGB data vertically to match depth data orientation
-        var flipSw = Stopwatch.StartNew();
-        FlipRGBDataVertically(rgbData, sourceTexture.width, sourceTexture.height, actualDataSize);
-        flipSw.Stop();
-        if (enablePerformanceTracking)
-            performanceTracker.RecordTime("RGB_VerticalFlip_Sync", flipSw.Elapsed.TotalMilliseconds);
+        // Flip RGB data vertically if enabled
+        if (settings.flipRGBVertically)
+        {
+            var flipSw = Stopwatch.StartNew();
+            FlipRGBDataVertically(rgbData, sourceTexture.width, sourceTexture.height, actualDataSize);
+            flipSw.Stop();
+            if (enablePerformanceTracking)
+                performanceTracker.RecordTime("RGB_VerticalFlip_Sync", flipSw.Elapsed.TotalMilliseconds);
+        }
         
         var publishData = new PublishData
         {
