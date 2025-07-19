@@ -74,7 +74,7 @@ public class LCMTestScript : MonoBehaviour
             {
                 // Set the target position for each articulation body
                 var drive = articulationBodies[i].xDrive;
-                if (i == 0)
+                if (i == 2) // change the index on this line for whichever one is the pillar platform
                 {
                     drive.target = (float)jointStateMessage.position[i];
                 }
